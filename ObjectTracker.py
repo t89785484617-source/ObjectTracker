@@ -606,28 +606,7 @@ class RTSPYOLOProcessor:
                                 thickness = max(1, int(3 * (i / len(points))))
                                 cv2.line(web_frame, points[i-1], points[i], color, thickness)
                     
-                    # Улучшенная статистика
-                    current_time = datetime.now().strftime("%H:%M:%S")
-                    elapsed = time.time() - self.start_time
-                    fps = self.processed_frame_count / elapsed if elapsed > 0 else 0
-                    
-                    text_x = self.config.web_width - 220
-                    stats_bg = np.zeros((100, 230, 3), dtype=np.uint8)
-                    stats_bg[:,:] = [0, 0, 0]
-                    
-                    # Накладываем полупрозрачный фон для статистики
-                    web_frame[10:110, text_x-10:text_x+220] = (
-                        web_frame[10:110, text_x-10:text_x+220] * 0.3 + stats_bg * 0.7
-                    ).astype(np.uint8)
-                    
-                    cv2.putText(web_frame, f"Time: {current_time}", (text_x, 30), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
-                    cv2.putText(web_frame, f"FPS: {fps:.1f}", (text_x, 50), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
-                    cv2.putText(web_frame, f"Objects: {len(tracked_detections)}", (text_x, 70), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
-                    cv2.putText(web_frame, f"Tracks: {len(self.object_tracker.tracked_objects)}", (text_x, 90), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+                    # УДАЛЕН БЛОК СТАТИСТИКИ - убраны строки с отображением FPS, Objects, Tracks и Processed
                     
                     # ОБНОВЛЕНИЕ с блокировкой!
                     with self._frame_lock:
@@ -693,21 +672,10 @@ class RTSPYOLOProcessor:
                         height: 100vh;
                         object-fit: contain;
                     }
-                    .stats {
-                        position: absolute;
-                        top: 10px;
-                        left: 10px;
-                        color: white;
-                        background: rgba(0,0,0,0.7);
-                        padding: 10px;
-                        border-radius: 5px;
-                        font-size: 14px;
-                    }
                 </style>
             </head>
             <body>
                 <img id="video" src="/video_feed">
-                <div class="stats" id="stats">Loading...</div>
 
                 <script>
                     function refreshVideo() {
@@ -726,25 +694,6 @@ class RTSPYOLOProcessor:
                     document.getElementById('video').onerror = function() {
                         setTimeout(refreshVideo, 1000);
                     };
-
-                    // Обновление статистики
-                    function updateStats() {
-                        fetch('/stats')
-                            .then(response => response.json())
-                            .then(data => {
-                                document.getElementById('stats').innerHTML = 
-                                    `Objects: ${data.objects_count}<br>
-                                     FPS: ${data.fps.toFixed(1)}<br>
-                                     Total Tracks: ${data.total_tracks}<br>
-                                     Processed: ${data.processed_frames}`;
-                            })
-                            .catch(() => {
-                                document.getElementById('stats').innerHTML = 'Stats unavailable';
-                            });
-                    }
-
-                    setInterval(updateStats, 1000);
-                    updateStats();
                 </script>
             </body>
             </html>
