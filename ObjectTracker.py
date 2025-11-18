@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 class Config:
     def __init__(self):
-        self.rtsp_url = "rtsp://admin:Jaquio@192.168.15.166:554/live"
+        self.rtsp_url = "rtsp://admin:Jaquio@192.168.105.8:554/live/main"
         self.model_path = "yolov8n.pt"
         
         # ФИКСИРОВАННЫЕ РАЗМЕРЫ
@@ -153,10 +153,14 @@ class TrackedObject:
         self.track_history = deque(maxlen=50)
         self.update_track_history()
         
-        # Счетчики для подтверждения трека
-        self.hit_streak = 1  # последовательные обнаружения
-        self.age = 1  # возраст трека в кадрах
-        self.time_since_update = 0  # время с последнего обновления
+        # Счетчики для подтверждения трека - ИСПРАВЛЕННАЯ ВЕРСИЯ
+        self.hit_streak = 0
+        self.age = 0
+        self.time_since_update = 0  # ⭐ ДОБАВЬТЕ ЭТУ СТРОКУ!
+        
+        # Сразу увеличиваем при создании
+        self.age += 1
+        self.hit_streak += 1
         
         # Визуальные особенности (упрощенные)
         self.appearance_features = self._extract_appearance(detection['bbox'])
@@ -181,6 +185,7 @@ class TrackedObject:
     def predict(self):
         """Предсказание следующей позиции"""
         predicted_bbox = self.kalman.predict()
+        self.age += 1
         self.time_since_update += 1
         self.update_track_history()
         return predicted_bbox
@@ -192,7 +197,6 @@ class TrackedObject:
         self.kalman.update(detection['bbox'])
         self.hit_streak += 1
         self.time_since_update = 0
-        self.age += 1
         self.update_track_history()
         
         # Обновление визуальных особенностей
