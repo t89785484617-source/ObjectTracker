@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Parking Lot Car Counter - RTSP to YOLO with Slanted Line Crossing Detection
+FIXED VERSION - Line Crossing Detection
 """
 
 import cv2
@@ -65,6 +66,9 @@ class ParkingConfig:
         # Формат: [(x1, y1), (x2, y2)] в относительных координатах (0-1)
         self.counting_line = [(0.0, 0.8), (0.7, 0.3)]  # Ваша настройка
         self.counting_direction = "up"  # "up" или "down"
+        
+        # ДЕБАГ-НАСТРОЙКИ
+        self.debug_line_crossing = True  # Включить логирование пересечений
 
 class KalmanFilter:
     """Упрощенный Kalman фильтр для трекинга автомобилей"""
@@ -150,11 +154,12 @@ class TrackedVehicle:
         self.age = 1
         self.time_since_update = 0
         
-        # Для подсчета пересечений линии
+        # Для подсчета пересечений линии - ИСПРАВЛЕННАЯ ЛОГИКА
         self.last_position = None
         self.has_crossed_line = False
         self.crossing_direction = None
         self.last_side = None  # На какой стороне линии находился в последний раз
+        self.crossing_cooldown = 0  # Защита от повторных срабатываний
         
         self.config = config
         self.update_track_history()
@@ -177,6 +182,11 @@ class TrackedVehicle:
         predicted_bbox = self.kalman.predict()
         self.age += 1
         self.time_since_update += 1
+        
+        # Уменьшаем кулдаун
+        if self.crossing_cooldown > 0:
+            self.crossing_cooldown -= 1
+            
         self.update_track_history()
         return predicted_bbox
     
@@ -189,40 +199,68 @@ class TrackedVehicle:
         self.update_track_history()
     
     def _point_side_of_line(self, point, line_start, line_end):
-        """Определяет на какой стороне линии находится точка"""
+        """Определяет на какой стороне линии находится точка - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
         x, y = point
         x1, y1 = line_start
         x2, y2 = line_end
         
         # Векторное произведение для определения стороны
+        # (x - x1)*(y2 - y1) - (y - y1)*(x2 - x1)
         d = (x - x1) * (y2 - y1) - (y - y1) * (x2 - x1)
-        return "left" if d > 0 else "right"
+        
+        # Для наклонной линии важно правильно определить стороны
+        # Если линия идет слева-сверху направо-вниз, то:
+        # - точки выше линии будут иметь d > 0 ("above")
+        # - точки ниже линии будут иметь d < 0 ("below")
+        return "above" if d > 0 else "below"
     
     def check_line_crossing(self, line_start, line_end):
-        """Проверка пересечения наклонной линии подсчета - УЛУЧШЕННАЯ ВЕРСИЯ"""
+        """Проверка пересечения наклонной линии подсчета - ПОЛНОСТЬЮ ПЕРЕПИСАННАЯ ЛОГИКА"""
+        
+        # Защита от повторных срабатываний
+        if self.crossing_cooldown > 0:
+            return False, None
+            
         if len(self.track_history) < 2:
             return False, None
         
+        # Берем последние две точки для определения движения
         current_point = self.track_history[-1]
-        previous_point = self.track_history[-2]
+        previous_point = self.track_history[-2] if len(self.track_history) >= 2 else self.track_history[-1]
         
         # Определяем на какой стороне линии находятся точки
         current_side = self._point_side_of_line(current_point, line_start, line_end)
         previous_side = self._point_side_of_line(previous_point, line_start, line_end)
         
-        # Если стороны разные - произошло пересечение
+        # Если стороны разные и мы еще не считали это пересечение
         if current_side != previous_side and not self.has_crossed_line:
-            # Определяем направление относительно конфига
+            
+            # Логируем для отладки
+            if self.config.debug_line_crossing:
+                logger.info(f"🔍 Пересечение обнаружено! ID:{self.object_id} "
+                           f"Стороны: {previous_side} -> {current_side} "
+                           f"Точки: {previous_point} -> {current_point}")
+            
+            # Определяем направление пересечения
             if self.config.counting_direction == "up":
-                # Для направления "up" считаем переход справа налево как въезд
-                direction = "up" if current_side == "left" and previous_side == "right" else "down"
+                # Для направления "up" считаем переход снизу вверх как въезд
+                if previous_side == "below" and current_side == "above":
+                    direction = "up"
+                else:
+                    direction = "down"
             else:
-                # Для направления "down" считаем переход слева направо как выезд  
-                direction = "down" if current_side == "right" and previous_side == "left" else "up"
+                # Для направления "down" считаем переход сверху вниз как выезд  
+                if previous_side == "above" and current_side == "below":
+                    direction = "down" 
+                else:
+                    direction = "up"
             
             self.has_crossed_line = True
             self.crossing_direction = direction
-            logger.info(f"🚗 Пересечение линии! ID:{self.object_id} Направление: {direction}")
+            self.crossing_cooldown = 10  # Защита от повторных срабатываний
+            
+            logger.info(f"🚗 ПЕРЕСЕЧЕНИЕ ЛИНИИ! ID:{self.object_id} Направление: {direction} "
+                       f"(был: {previous_side}, стал: {current_side})")
             return True, direction
         
         return False, None
@@ -307,6 +345,7 @@ class ParkingLotTracker:
                 vehicle.time_since_update += 1
                 
                 if vehicle.time_since_update > self.config.tracker_max_age:
+                    logger.info(f"🗑️ Удален трек ID:{track_id} (возраст: {vehicle.time_since_update})")
                     del self.tracked_vehicles[track_id]
         
         # Создание новых треков
@@ -335,7 +374,7 @@ class ParkingLotTracker:
         return active_detections
     
     def _check_line_crossings(self):
-        """Проверка пересечений наклонной линии подсчета для всех автомобилей"""
+        """Проверка пересечений наклонной линии подсчета для всех автомобилей - ИСПРАВЛЕННАЯ"""
         # Конвертируем относительные координаты линии в абсолютные для processing кадра
         line_start = (
             self.config.counting_line[0][0] * self.config.processing_width,
@@ -352,10 +391,14 @@ class ParkingLotTracker:
             if crossed:
                 if direction == "up":
                     self.vehicles_in += 1
-                    logger.info(f"🚗 ВЪЕХАЛА машина! ID:{vehicle.object_id} Всего въехало: {self.vehicles_in}")
+                    logger.info(f"🟢 ВЪЕХАЛА машина! ID:{vehicle.object_id} "
+                               f"Всего въехало: {self.vehicles_in}, "
+                               f"Сейчас на парковке: {self.current_vehicles}")
                 else:
                     self.vehicles_out += 1
-                    logger.info(f"🚗 ВЫЕХАЛА машина! ID:{vehicle.object_id} Всего выехало: {self.vehicles_out}")
+                    logger.info(f"🔴 ВЫЕХАЛА машина! ID:{vehicle.object_id} "
+                               f"Всего выехало: {self.vehicles_out}, "
+                               f"Сейчас на парковке: {self.current_vehicles}")
     
     def _create_similarity_matrix(self, detections):
         track_ids = list(self.tracked_vehicles.keys())
@@ -377,7 +420,8 @@ class ParkingLotTracker:
         object_id = self.next_object_id
         self.tracked_vehicles[object_id] = TrackedVehicle(object_id, detection, self.config)
         self.next_object_id += 1
-        logger.info(f"🆕 Новый трек: ID:{object_id} {detection['class_name']}")
+        logger.info(f"🆕 Новый трек: ID:{object_id} {detection['class_name']} "
+                   f"conf:{detection['confidence']:.2f}")
 
 class ParkingLotProcessor:
     def __init__(self, config):
@@ -534,10 +578,10 @@ class ParkingLotProcessor:
         return [int(c) for c in bgr_color[0][0]]
 
     def _draw_parking_info(self, frame):
-        """Отрисовка информации о парковке на кадре"""
+        """Отрисовка информации о парковке на кадре - УЛУЧШЕННАЯ ВЕРСИЯ"""
         h, w = frame.shape[:2]
         
-        # Наклонная линия подсчета (оставляем только линию, без текста)
+        # Наклонная линия подсчета
         line_start = (
             int(self.config.counting_line[0][0] * w),
             int(self.config.counting_line[0][1] * h)
@@ -547,10 +591,30 @@ class ParkingLotProcessor:
             int(self.config.counting_line[1][1] * h)
         )
         
+        # Рисуем линию подсчета
         cv2.line(frame, line_start, line_end, (0, 255, 255), 2)
         
+        # Добавляем стрелки направления
+        line_center = (
+            (line_start[0] + line_end[0]) // 2,
+            (line_start[1] + line_end[1]) // 2
+        )
+        
+        # Направление стрелки в зависимости от конфига
+        if self.config.counting_direction == "up":
+            arrow_end = (line_center[0] - 20, line_center[1] - 20)
+            direction_text = "IN"
+        else:
+            arrow_end = (line_center[0] + 20, line_center[1] + 20)
+            direction_text = "OUT"
+            
+        cv2.arrowedLine(frame, line_center, arrow_end, (0, 255, 255), 2)
+        cv2.putText(frame, direction_text, 
+                   (arrow_end[0] + 5, arrow_end[1] - 5), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        
         # Статистика парковки
-        stats_bg = np.zeros((120, 300, 3), dtype=np.uint8)
+        stats_bg = np.zeros((140, 320, 3), dtype=np.uint8)
         stats_bg[:] = (0, 0, 0)
         
         # Позиционируем статистику в левом верхнем углу
@@ -564,6 +628,8 @@ class ParkingLotProcessor:
                    (x_offset, y_offset + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.putText(frame, f"INITIAL: {self.parking_tracker.initial_count}", 
                    (x_offset, y_offset + 95), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
+        cv2.putText(frame, f"TRACKS: {len(self.parking_tracker.tracked_vehicles)}", 
+                   (x_offset, y_offset + 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 1)
         
         return frame
 
@@ -644,7 +710,9 @@ class ParkingLotProcessor:
                             # Подпись
                             label = f"ID:{object_id} {det['class_name']} {det['confidence']:.2f}"
                             if det.get('has_crossed_line', False):
-                                label += " COUNTED"
+                                label += " ✓"
+                                # Подсвечиваем посчитанные автомобили
+                                cv2.rectangle(web_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
                             
                             (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                             cv2.rectangle(web_frame, (x1, y1-text_height-10), 
@@ -693,7 +761,7 @@ class ParkingLotProcessor:
             <!DOCTYPE html>
             <html>
             <head>
-                <title>Parking Lot Car Counter</title>
+                <title>Parking Lot Car Counter - FIXED</title>
                 <meta charset="utf-8">
                 <style>
                     body { 
@@ -741,10 +809,21 @@ class ParkingLotProcessor:
                     .stats p {
                         margin: 5px 0;
                     }
+                    .debug-info {
+                        position: absolute;
+                        bottom: 10px;
+                        left: 10px;
+                        background: rgba(0,0,0,0.7);
+                        padding: 10px;
+                        border-radius: 5px;
+                        color: white;
+                        font-size: 12px;
+                    }
                 </style>
             </head>
             <body>
                 <div class="controls">
+                    <h3>Parking Counter FIXED</h3>
                     <input type="number" id="initialCount" placeholder="Начальное количество" min="0">
                     <button onclick="setInitialCount()">Установить</button>
                     <button onclick="resetCounters()">Сбросить счетчики</button>
@@ -753,7 +832,13 @@ class ParkingLotProcessor:
                         <p>Выехало: <span id="outCount">0</span></p>
                         <p>Сейчас: <span id="currentCount">0</span></p>
                         <p>Начальное: <span id="initialCountDisplay">0</span></p>
+                        <p>Активных треков: <span id="activeTracks">0</span></p>
                     </div>
+                </div>
+                <div class="debug-info" id="debugInfo">
+                    <p>Линия подсчета: Желтая</p>
+                    <p>Направление: <span id="directionInfo">up</span></p>
+                    <p>Зеленые рамки = посчитаны</p>
                 </div>
                 <img id="video" src="/video_feed">
 
@@ -809,11 +894,13 @@ class ParkingLotProcessor:
                             document.getElementById('outCount').textContent = data.vehicles_out;
                             document.getElementById('currentCount').textContent = data.current_vehicles;
                             document.getElementById('initialCountDisplay').textContent = data.initial_count;
+                            document.getElementById('activeTracks').textContent = data.active_tracks;
+                            document.getElementById('directionInfo').textContent = data.counting_direction;
                         });
                     }
 
-                    // Обновляем статистику каждые 3 секунды
-                    setInterval(updateStats, 3000);
+                    // Обновляем статистику каждые 2 секунды
+                    setInterval(updateStats, 2000);
                     
                     // Обновляем видео каждые 5 минут для надежности
                     setInterval(refreshVideo, 300000);
@@ -865,6 +952,8 @@ class ParkingLotProcessor:
                 'vehicles_out': self.parking_tracker.vehicles_out,
                 'current_vehicles': self.parking_tracker.current_vehicles,
                 'initial_count': self.parking_tracker.initial_count,
+                'active_tracks': len(self.parking_tracker.tracked_vehicles),
+                'counting_direction': self.config.counting_direction,
                 'fps': round(fps, 1),
                 'processed_frames': self.processed_frame_count,
                 'uptime': round(elapsed, 1)
@@ -918,6 +1007,8 @@ class ParkingLotProcessor:
         process_thread.start()
         
         logger.info("✅ Система подсчета парковки запущена")
+        logger.info(f"🎯 Направление подсчета: {self.config.counting_direction}")
+        logger.info(f"📏 Линия подсчета: {self.config.counting_line}")
         return True
 
     def start(self):
@@ -941,6 +1032,7 @@ def main():
             logger.info("✅ Система подсчета автомобилей на парковке запущена")
             logger.info("🚗 Настройте counting_line в конфиге под вашу камеру")
             logger.info("💡 Используйте веб-интерфейс для установки начального количества машин")
+            logger.info("🔧 Включен режим отладки пересечений линии")
         else:
             logger.error("❌ Не удалось запустить систему")
     except KeyboardInterrupt:
