@@ -41,7 +41,7 @@ analytics_logger.propagate = False
 
 class Config:
     def __init__(self):
-        self.rtsp_url = "rtsp://admin:Jaquio@192.168.105.8:554/live/main"
+        self.rtsp_url = "rtsp://admin:Jaquio@172.30.0.68:554/live/main"
         self.model_path = "yolov8n.pt"
         
         # ФИКСИРОВАННЫЕ РАЗМЕРЫ
