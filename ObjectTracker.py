@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Production RTSP to YOLO Processor - ADVANCED OBJECT TRACKING
+Production RTSP to YOLO Processor - ADVANCED OBJECT TRACKING with ANALYTICS
 """
 
 import cv2
@@ -20,6 +20,7 @@ from collections import OrderedDict, deque
 import scipy.spatial as sp
 from scipy.optimize import linear_sum_assignment
 
+# Настройка основного логгера
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -29,6 +30,14 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# НАСТРОЙКА ЛОГГЕРА ДЛЯ АНАЛИТИКИ ТРЕКИНГА
+analytics_logger = logging.getLogger('tracking_analytics')
+analytics_logger.setLevel(logging.INFO)
+analytics_handler = logging.FileHandler('tracking_analytics.log')
+analytics_handler.setFormatter(logging.Formatter('%(message)s'))
+analytics_logger.addHandler(analytics_handler)
+analytics_logger.propagate = False
 
 class Config:
     def __init__(self):
@@ -55,11 +64,15 @@ class Config:
         self.web_quality = 60
         
         # УЛУЧШЕННЫЕ НАСТРОЙКИ ТРЕКЕРА
-        self.tracker_max_age = 30  # увеличен срок жизни объекта
-        self.tracker_min_hits = 3  # минимальное количество детекций для подтверждения
-        self.tracker_iou_threshold = 0.4  # более строгий порог
-        self.tracker_appearance_weight = 0.7  # вес внешнего вида vs движения
-        self.tracker_velocity_weight = 0.3  # вес скорости
+        self.tracker_max_age = 30
+        self.tracker_min_hits = 3
+        self.tracker_iou_threshold = 0.4
+        self.tracker_appearance_weight = 0.7
+        self.tracker_velocity_weight = 0.3
+        
+        # НАСТРОЙКИ ЛОГИРОВАНИЯ АНАЛИТИКИ
+        self.analytics_log_interval = 5  # секунды между логами аналитики
+        self.detailed_log_interval = 30  # секунды для детального лога
 
 class KalmanFilter:
     """Упрощенный Kalman фильтр для трекинга объектов"""
@@ -353,6 +366,18 @@ class RTSPYOLOProcessor:
         self.detection_count = 0
         self.start_time = time.time()
         
+        # Для аналитики
+        self.last_analytics_log_time = 0
+        self.last_detailed_log_time = 0
+        self.tracking_stats = {
+            'total_tracks_created': 0,
+            'total_tracks_lost': 0,
+            'max_track_age': 0,
+            'max_track_hits': 0,
+            'class_distribution': {},
+            'track_quality_history': []
+        }
+        
         # ЕДИНСТВЕННОЕ место для хранения текущего кадра
         self._current_output_frame = self._create_info_frame("Starting...")
         self._current_detections = []
@@ -507,8 +532,119 @@ class RTSPYOLOProcessor:
         bgr_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)
         return [int(c) for c in bgr_color[0][0]]
 
+    def _log_tracking_analytics(self):
+        """Логирование аналитики трекинга"""
+        current_time = time.time()
+        
+        # Логируем базовую аналитику каждые N секунд
+        if current_time - self.last_analytics_log_time >= self.config.analytics_log_interval:
+            active_tracks = len(self.object_tracker.tracked_objects)
+            active_detections = len(self._current_detections)
+            
+            # Собираем статистику по активным трекам
+            track_qualities = []
+            class_distribution = {}
+            
+            for obj_id, obj in self.object_tracker.tracked_objects.items():
+                quality = obj.hit_streak / obj.age if obj.age > 0 else 1.0
+                track_qualities.append(quality)
+                
+                # Распределение по классам
+                class_name = obj.class_name
+                class_distribution[class_name] = class_distribution.get(class_name, 0) + 1
+                
+                # Обновляем максимальные значения
+                self.tracking_stats['max_track_age'] = max(self.tracking_stats['max_track_age'], obj.age)
+                self.tracking_stats['max_track_hits'] = max(self.tracking_stats['max_track_hits'], obj.hit_streak)
+            
+            avg_quality = np.mean(track_qualities) if track_qualities else 0
+            
+            # Логируем базовую аналитику
+            analytics_data = {
+                'timestamp': datetime.now().isoformat(),
+                'active_tracks': active_tracks,
+                'active_detections': active_detections,
+                'avg_track_quality': round(avg_quality, 3),
+                'min_track_quality': round(min(track_qualities), 3) if track_qualities else 0,
+                'max_track_quality': round(max(track_qualities), 3) if track_qualities else 0,
+                'class_distribution': class_distribution,
+                'total_processed_frames': self.processed_frame_count,
+                'total_detections': self.detection_count
+            }
+            
+            analytics_logger.info(json.dumps(analytics_data))
+            self.last_analytics_log_time = current_time
+            
+            # Сохраняем историю качества
+            self.tracking_stats['track_quality_history'].append({
+                'time': current_time,
+                'avg_quality': avg_quality,
+                'active_tracks': active_tracks
+            })
+            
+            # Ограничиваем размер истории
+            if len(self.tracking_stats['track_quality_history']) > 1000:
+                self.tracking_stats['track_quality_history'] = self.tracking_stats['track_quality_history'][-1000:]
+        
+        # Детальное логирование каждые 30 секунд
+        if current_time - self.last_detailed_log_time >= self.config.detailed_log_interval:
+            self._log_detailed_tracking_info()
+            self.last_detailed_log_time = current_time
+
+    def _log_detailed_tracking_info(self):
+        """Детальное логирование информации о треках"""
+        detailed_info = {
+            'timestamp': datetime.now().isoformat(),
+            'total_tracks_created': self.tracking_stats['total_tracks_created'],
+            'total_tracks_lost': self.tracking_stats['total_tracks_lost'],
+            'max_track_age': self.tracking_stats['max_track_age'],
+            'max_track_hits': self.tracking_stats['max_track_hits'],
+            'current_tracks': []
+        }
+        
+        for obj_id, obj in self.object_tracker.tracked_objects.items():
+            track_info = {
+                'id': obj_id,
+                'class': obj.class_name,
+                'age': obj.age,
+                'hits': obj.hit_streak,
+                'quality': round(obj.hit_streak / obj.age, 3) if obj.age > 0 else 1.0,
+                'time_since_update': obj.time_since_update,
+                'current_confidence': obj.confidence
+            }
+            detailed_info['current_tracks'].append(track_info)
+        
+        # Логируем в отдельный файл для детального анализа
+        with open('detailed_tracking_analysis.log', 'a') as f:
+            f.write(json.dumps(detailed_info) + '\n')
+        
+        logger.info(f"📊 Детальная аналитика: {len(detailed_info['current_tracks'])} активных треков, "
+                   f"макс. возраст: {self.tracking_stats['max_track_age']}, "
+                   f"макс. hits: {self.tracking_stats['max_track_hits']}")
+
+    def _update_tracking_stats(self, detections_before, detections_after):
+        """Обновление статистики трекинга после обработки кадра"""
+        # Обновляем счетчики созданных/потерянных треков
+        current_track_ids = set(obj.object_id for obj in self.object_tracker.tracked_objects.values())
+        previous_track_ids = set(det['object_id'] for det in detections_before) if detections_before else set()
+        
+        new_tracks = current_track_ids - previous_track_ids
+        lost_tracks = previous_track_ids - current_track_ids
+        
+        self.tracking_stats['total_tracks_created'] += len(new_tracks)
+        self.tracking_stats['total_tracks_lost'] += len(lost_tracks)
+        
+        # Логируем создание новых треков
+        for track_id in new_tracks:
+            obj = self.object_tracker.tracked_objects[track_id]
+            logger.info(f"🆕 Новый трек: ID:{track_id} {obj.class_name} (confidence: {obj.confidence:.2f})")
+        
+        # Логируем потерю треков
+        for track_id in lost_tracks:
+            logger.info(f"❌ Потерян трек: ID:{track_id}")
+
     def process_frames(self):
-        """Обработка кадров с YOLO - с улучшенным трекингом"""
+        """Обработка кадров с YOLO - с улучшенным трекингом и аналитикой"""
         logger.info("🔍 Запуск обработки YOLO с улучшенным трекингом")
         frame_counter = 0
         
@@ -517,6 +653,9 @@ class RTSPYOLOProcessor:
                 # Берем кадр из буфера обработки
                 frame = self.processing_buffer.get(timeout=1.0)
                 frame_counter += 1
+                
+                # Сохраняем предыдущие детекции для анализа изменений
+                previous_detections = self._current_detections.copy()
                 
                 # Обрабатываем каждый N-й кадр
                 if frame_counter % self.config.process_every_n == 0:
@@ -554,6 +693,12 @@ class RTSPYOLOProcessor:
                     # ОБНОВЛЕНИЕ УЛУЧШЕННОГО ТРЕКЕРА
                     tracked_detections = self.object_tracker.update(detections)
                     
+                    # ОБНОВЛЯЕМ СТАТИСТИКУ ТРЕКИНГА
+                    self._update_tracking_stats(previous_detections, tracked_detections)
+                    
+                    # ЛОГИРУЕМ АНАЛИТИКУ
+                    self._log_tracking_analytics()
+                    
                     # Создание кадра для веб-вывода
                     web_frame = self.resize_frame_proportional(
                         frame,
@@ -583,8 +728,9 @@ class RTSPYOLOProcessor:
                         # Подпись с улучшенной информацией
                         age = det.get('age', 1)
                         hit_streak = det.get('hit_streak', 1)
+                        quality = hit_streak / age if age > 0 else 1.0
                         label = f"ID:{object_id} {det['class_name']} {det['confidence']:.2f}"
-                        sub_label = f"Age:{age} Hits:{hit_streak}"
+                        sub_label = f"Age:{age} Hits:{hit_streak} Q:{quality:.2f}"
                         
                         (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                         
@@ -610,8 +756,6 @@ class RTSPYOLOProcessor:
                                 thickness = max(1, int(3 * (i / len(points))))
                                 cv2.line(web_frame, points[i-1], points[i], color, thickness)
                     
-                    # УДАЛЕН БЛОК СТАТИСТИКИ - убраны строки с отображением FPS, Objects, Tracks и Processed
-                    
                     # ОБНОВЛЕНИЕ с блокировкой!
                     with self._frame_lock:
                         self._current_output_frame = web_frame.copy()
@@ -625,33 +769,9 @@ class RTSPYOLOProcessor:
                 logger.error(f"Ошибка обработки: {e}")
                 time.sleep(0.1)
 
-    def start_processing(self):
-        """Запуск обработки"""
-        if not self.start_ffmpeg():
-            return False
-        
-        if not self.load_yolo_model():
-            return False
-        
-        self.running = True
-        
-        # Инициализация начального кадра
-        with self._frame_lock:
-            self._current_output_frame = self._create_info_frame("Initializing...")
-        
-        # Запуск потоков
-        capture_thread = threading.Thread(target=self.capture_frames, daemon=True)
-        process_thread = threading.Thread(target=self.process_frames, daemon=True)
-        
-        capture_thread.start()
-        time.sleep(3)  # Даем время на запуск захвата
-        process_thread.start()
-        
-        logger.info("✅ Все потоки запущены")
-        return True
-
+    # ДОБАВЛЯЕМ НОВЫЕ ЭНДПОИНТЫ ДЛЯ АНАЛИТИКИ
     def start_web_server(self):
-        """Запуск веб-сервера с фиксированным FPS"""
+        """Запуск веб-сервера с фиксированным FPS и аналитикой"""
         app = Flask(__name__)
         
         @app.route('/')
@@ -706,34 +826,26 @@ class RTSPYOLOProcessor:
         @app.route('/video_feed')
         def video_feed():
             def generate():
-                target_fps = 10  # Фиксированный FPS для веб-потока
+                target_fps = 10
                 frame_interval = 1.0 / target_fps
                 last_frame_time = 0
                 
                 while True:
                     try:
                         current_time = time.time()
-                        
-                        # Строгое соблюдение интервала FPS
                         if current_time - last_frame_time >= frame_interval:
                             frame, detections = self.get_latest_frame()
-                            
                             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), self.config.web_quality]
                             success, encoded_image = cv2.imencode('.jpg', frame, encode_param)
-                            
                             if success:
                                 yield (b'--frame\r\n'
                                        b'Content-Type: image/jpeg\r\n\r\n' + 
                                        encoded_image.tobytes() + b'\r\n')
                                 last_frame_time = current_time
-                        
-                        # Стабильная задержка
                         time.sleep(0.001)
-                        
                     except Exception as e:
                         logger.error(f"Ошибка в видеопотоке: {e}")
                         time.sleep(0.1)
-            
             return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
         
         @app.route('/stats')
@@ -741,16 +853,80 @@ class RTSPYOLOProcessor:
             elapsed = time.time() - self.start_time
             fps = self.processed_frame_count / elapsed if elapsed > 0 else 0
             
+            # Рассчитываем качество трекинга
+            track_qualities = []
+            for obj in self.object_tracker.tracked_objects.values():
+                if obj.age > 0:
+                    track_qualities.append(obj.hit_streak / obj.age)
+            
+            avg_quality = np.mean(track_qualities) if track_qualities else 0
+            
             return {
                 'objects_count': len(self._current_detections),
-                'fps': fps,
+                'fps': round(fps, 1),
                 'total_tracks': len(self.object_tracker.tracked_objects),
                 'processed_frames': self.processed_frame_count,
-                'total_detections': self.detection_count
+                'total_detections': self.detection_count,
+                'avg_track_quality': round(avg_quality, 3),
+                'tracks_created': self.tracking_stats['total_tracks_created'],
+                'tracks_lost': self.tracking_stats['total_tracks_lost'],
+                'max_track_age': self.tracking_stats['max_track_age'],
+                'max_track_hits': self.tracking_stats['max_track_hits']
+            }
+        
+        @app.route('/analytics')
+        def analytics():
+            """Расширенная аналитика трекинга"""
+            current_tracks = []
+            for obj_id, obj in self.object_tracker.tracked_objects.items():
+                quality = obj.hit_streak / obj.age if obj.age > 0 else 1.0
+                current_tracks.append({
+                    'id': obj_id,
+                    'class': obj.class_name,
+                    'age': obj.age,
+                    'hits': obj.hit_streak,
+                    'quality': round(quality, 3),
+                    'time_since_update': obj.time_since_update,
+                    'confidence': round(obj.confidence, 3)
+                })
+            
+            # Сортируем по качеству
+            current_tracks.sort(key=lambda x: x['quality'], reverse=True)
+            
+            return {
+                'current_tracks': current_tracks,
+                'tracking_stats': self.tracking_stats,
+                'system_uptime': round(time.time() - self.start_time, 1)
             }
         
         logger.info(f"🌐 Запуск веб-сервера на http://{self.config.web_host}:{self.config.web_port}")
+        logger.info("📊 Доступна аналитика по адресу: /stats и /analytics")
         app.run(host=self.config.web_host, port=self.config.web_port, threaded=True, debug=False)
+
+    def start_processing(self):
+        """Запуск обработки"""
+        if not self.start_ffmpeg():
+            return False
+        
+        if not self.load_yolo_model():
+            return False
+        
+        self.running = True
+        
+        # Инициализация начального кадра
+        with self._frame_lock:
+            self._current_output_frame = self._create_info_frame("Initializing...")
+        
+        # Запуск потоков
+        capture_thread = threading.Thread(target=self.capture_frames, daemon=True)
+        process_thread = threading.Thread(target=self.process_frames, daemon=True)
+        
+        capture_thread.start()
+        time.sleep(3)  # Даем время на запуск захвата
+        process_thread.start()
+        
+        logger.info("✅ Все потоки запущены")
+        return True
 
     def start(self):
         """Запуск всей системы"""
@@ -772,7 +948,9 @@ def main():
     
     try:
         if processor.start():
-            logger.info("✅ Система запущена с улучшенным трекингом")
+            logger.info("✅ Система запущена с улучшенным трекингом и аналитикой")
+            logger.info("📊 Логи аналитики сохраняются в tracking_analytics.log")
+            logger.info("📈 Детальная аналитика в detailed_tracking_analysis.log")
         else:
             logger.error("❌ Не удалось запустить систему")
     except KeyboardInterrupt:
