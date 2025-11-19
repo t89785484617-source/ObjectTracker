@@ -10,7 +10,7 @@ import subprocess
 import numpy as np
 import select
 import threading
-from flask import Flask, Response
+from flask import Flask, Response, request, jsonify
 from ultralytics import YOLO
 import queue
 import json
@@ -63,8 +63,7 @@ class ParkingConfig:
         
         # НАКЛОННАЯ ЛИНИЯ ПОДСЧЕТА (настройте под вашу камеру)
         # Формат: [(x1, y1), (x2, y2)] в относительных координатах (0-1)
-        # Левый край ниже центра, правый выше центра
-        self.counting_line = [(0.0, 0.8), (0.7, 0.4)]  # Пример наклонной линии
+        self.counting_line = [(0.0, 0.8), (0.7, 0.3)]  # Ваша настройка
         self.counting_direction = "up"  # "up" или "down"
 
 class KalmanFilter:
@@ -155,6 +154,7 @@ class TrackedVehicle:
         self.last_position = None
         self.has_crossed_line = False
         self.crossing_direction = None
+        self.last_side = None  # На какой стороне линии находился в последний раз
         
         self.config = config
         self.update_track_history()
@@ -188,50 +188,44 @@ class TrackedVehicle:
         self.time_since_update = 0
         self.update_track_history()
     
+    def _point_side_of_line(self, point, line_start, line_end):
+        """Определяет на какой стороне линии находится точка"""
+        x, y = point
+        x1, y1 = line_start
+        x2, y2 = line_end
+        
+        # Векторное произведение для определения стороны
+        d = (x - x1) * (y2 - y1) - (y - y1) * (x2 - x1)
+        return "left" if d > 0 else "right"
+    
     def check_line_crossing(self, line_start, line_end):
-        """Проверка пересечения наклонной линии подсчета"""
+        """Проверка пересечения наклонной линии подсчета - УЛУЧШЕННАЯ ВЕРСИЯ"""
         if len(self.track_history) < 2:
             return False, None
         
         current_point = self.track_history[-1]
         previous_point = self.track_history[-2]
         
-        # Проверяем пересечение линии
-        if self._line_intersection(previous_point, current_point, line_start, line_end):
-            # Определяем направление относительно линии
-            direction = self._get_crossing_direction(previous_point, current_point, line_start, line_end)
+        # Определяем на какой стороне линии находятся точки
+        current_side = self._point_side_of_line(current_point, line_start, line_end)
+        previous_side = self._point_side_of_line(previous_point, line_start, line_end)
+        
+        # Если стороны разные - произошло пересечение
+        if current_side != previous_side and not self.has_crossed_line:
+            # Определяем направление относительно конфига
+            if self.config.counting_direction == "up":
+                # Для направления "up" считаем переход справа налево как въезд
+                direction = "up" if current_side == "left" and previous_side == "right" else "down"
+            else:
+                # Для направления "down" считаем переход слева направо как выезд  
+                direction = "down" if current_side == "right" and previous_side == "left" else "up"
             
-            # Проверяем соответствие требуемому направлению
-            if direction == self.config.counting_direction and not self.has_crossed_line:
-                self.has_crossed_line = True
-                return True, direction
+            self.has_crossed_line = True
+            self.crossing_direction = direction
+            logger.info(f"🚗 Пересечение линии! ID:{self.object_id} Направление: {direction}")
+            return True, direction
         
         return False, None
-    
-    def _line_intersection(self, p1, p2, p3, p4):
-        """Проверка пересечения двух отрезков"""
-        def ccw(A, B, C):
-            return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
-        
-        A, B, C, D = p1, p2, p3, p4
-        return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
-    
-    def _get_crossing_direction(self, prev_point, curr_point, line_start, line_end):
-        """Определение направления пересечения относительно наклонной линии"""
-        # Вектор линии
-        line_vector = (line_end[0] - line_start[0], line_end[1] - line_start[1])
-        
-        # Вектор движения
-        move_vector = (curr_point[0] - prev_point[0], curr_point[1] - prev_point[1])
-        
-        # Векторное произведение для определения стороны
-        cross_product = line_vector[0] * move_vector[1] - line_vector[1] * move_vector[0]
-        
-        # Для наклонной линии определяем направление по вертикальной компоненте
-        if cross_product > 0:
-            return "up" if line_vector[0] > 0 else "down"
-        else:
-            return "down" if line_vector[0] > 0 else "up"
     
     def similarity_score(self, detection):
         """Оценка схожести с новой детекцией"""
@@ -271,6 +265,13 @@ class ParkingLotTracker:
         self.vehicles_in = 0
         self.vehicles_out = 0
         self.current_vehicles = 0
+        self.initial_count = 0  # Начальное количество машин
+        
+    def set_initial_count(self, count):
+        """Установить начальное количество машин на парковке"""
+        self.initial_count = count
+        self.current_vehicles = count
+        logger.info(f"🎯 Установлено начальное количество машин: {count}")
         
     def update(self, detections):
         """Обновление трекера с подсчетом пересечений"""
@@ -318,7 +319,8 @@ class ParkingLotTracker:
         self._check_line_crossings()
         
         # Обновление текущего количества автомобилей
-        self.current_vehicles = len(self.tracked_vehicles)
+        # current_vehicles = initial_count + (въехало - выехало)
+        self.current_vehicles = max(0, self.initial_count + (self.vehicles_in - self.vehicles_out))
         
         # Возврат активных треков
         active_detections = []
@@ -350,10 +352,10 @@ class ParkingLotTracker:
             if crossed:
                 if direction == "up":
                     self.vehicles_in += 1
-                    logger.info(f"🚗 ВЪЕХАЛА машина! Всего въехало: {self.vehicles_in}")
+                    logger.info(f"🚗 ВЪЕХАЛА машина! ID:{vehicle.object_id} Всего въехало: {self.vehicles_in}")
                 else:
                     self.vehicles_out += 1
-                    logger.info(f"🚗 ВЫЕХАЛА машина! Всего выехало: {self.vehicles_out}")
+                    logger.info(f"🚗 ВЫЕХАЛА машина! ID:{vehicle.object_id} Всего выехало: {self.vehicles_out}")
     
     def _create_similarity_matrix(self, detections):
         track_ids = list(self.tracked_vehicles.keys())
@@ -535,7 +537,7 @@ class ParkingLotProcessor:
         """Отрисовка информации о парковке на кадре"""
         h, w = frame.shape[:2]
         
-        # Наклонная линия подсчета
+        # Наклонная линия подсчета (оставляем только линию, без текста)
         line_start = (
             int(self.config.counting_line[0][0] * w),
             int(self.config.counting_line[0][1] * h)
@@ -546,13 +548,22 @@ class ParkingLotProcessor:
         )
         
         cv2.line(frame, line_start, line_end, (0, 255, 255), 2)
-        cv2.putText(frame, "COUNTING LINE", (line_start[0], line_start[1] - 10), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         
         # Статистика парковки
-        stats_text = f"IN: {self.parking_tracker.vehicles_in} OUT: {self.parking_tracker.vehicles_out}"
-        cv2.putText(frame, stats_text, (w - 200, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        stats_bg = np.zeros((120, 300, 3), dtype=np.uint8)
+        stats_bg[:] = (0, 0, 0)
+        
+        # Позиционируем статистику в левом верхнем углу
+        x_offset, y_offset = 10, 10
+        
+        cv2.putText(frame, f"IN: {self.parking_tracker.vehicles_in}", 
+                   (x_offset, y_offset + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"OUT: {self.parking_tracker.vehicles_out}", 
+                   (x_offset, y_offset + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cv2.putText(frame, f"NOW: {self.parking_tracker.current_vehicles}", 
+                   (x_offset, y_offset + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, f"INITIAL: {self.parking_tracker.initial_count}", 
+                   (x_offset, y_offset + 95), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
         
         return frame
 
@@ -697,9 +708,53 @@ class ParkingLotProcessor:
                         height: 100vh;
                         object-fit: contain;
                     }
+                    .controls {
+                        position: absolute;
+                        top: 10px;
+                        right: 10px;
+                        background: rgba(0,0,0,0.7);
+                        padding: 15px;
+                        border-radius: 10px;
+                        color: white;
+                        z-index: 1000;
+                        min-width: 250px;
+                    }
+                    .controls input, .controls button {
+                        margin: 5px;
+                        padding: 8px;
+                        border: none;
+                        border-radius: 5px;
+                        width: 90%;
+                    }
+                    .controls button {
+                        background: #4CAF50;
+                        color: white;
+                        cursor: pointer;
+                    }
+                    .controls button:hover {
+                        background: #45a049;
+                    }
+                    .stats {
+                        margin-top: 10px;
+                        font-size: 14px;
+                    }
+                    .stats p {
+                        margin: 5px 0;
+                    }
                 </style>
             </head>
             <body>
+                <div class="controls">
+                    <input type="number" id="initialCount" placeholder="Начальное количество" min="0">
+                    <button onclick="setInitialCount()">Установить</button>
+                    <button onclick="resetCounters()">Сбросить счетчики</button>
+                    <div class="stats" id="stats">
+                        <p>Въехало: <span id="inCount">0</span></p>
+                        <p>Выехало: <span id="outCount">0</span></p>
+                        <p>Сейчас: <span id="currentCount">0</span></p>
+                        <p>Начальное: <span id="initialCountDisplay">0</span></p>
+                    </div>
+                </div>
                 <img id="video" src="/video_feed">
 
                 <script>
@@ -708,6 +763,58 @@ class ParkingLotProcessor:
                         video.src = '/video_feed?t=' + new Date().getTime();
                     }
 
+                    function setInitialCount() {
+                        const count = document.getElementById('initialCount').value;
+                        if (count === '') {
+                            alert('Введите количество машин');
+                            return;
+                        }
+                        
+                        fetch('/set_initial', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({count: parseInt(count)})
+                        })
+                        .then(response => response.json())
+                        .then(data => {
+                            alert(data.message);
+                            updateStats();
+                        })
+                        .catch(error => {
+                            console.error('Error:', error);
+                            alert('Ошибка при установке начального количества');
+                        });
+                    }
+
+                    function resetCounters() {
+                        fetch('/reset')
+                        .then(response => response.json())
+                        .then(data => {
+                            alert('Счетчики сброшены');
+                            updateStats();
+                        })
+                        .catch(error => {
+                            console.error('Error:', error);
+                            alert('Ошибка при сбросе счетчиков');
+                        });
+                    }
+
+                    function updateStats() {
+                        fetch('/stats')
+                        .then(response => response.json())
+                        .then(data => {
+                            document.getElementById('inCount').textContent = data.vehicles_in;
+                            document.getElementById('outCount').textContent = data.vehicles_out;
+                            document.getElementById('currentCount').textContent = data.current_vehicles;
+                            document.getElementById('initialCountDisplay').textContent = data.initial_count;
+                        });
+                    }
+
+                    // Обновляем статистику каждые 3 секунды
+                    setInterval(updateStats, 3000);
+                    
                     // Обновляем видео каждые 5 минут для надежности
                     setInterval(refreshVideo, 300000);
 
@@ -715,6 +822,9 @@ class ParkingLotProcessor:
                     document.getElementById('video').onerror = function() {
                         setTimeout(refreshVideo, 1000);
                     };
+
+                    // Первоначальная загрузка статистики
+                    updateStats();
                 </script>
             </body>
             </html>
@@ -750,20 +860,40 @@ class ParkingLotProcessor:
             elapsed = time.time() - self.start_time
             fps = self.processed_frame_count / elapsed if elapsed > 0 else 0
             
-            return {
+            return jsonify({
                 'vehicles_in': self.parking_tracker.vehicles_in,
                 'vehicles_out': self.parking_tracker.vehicles_out,
                 'current_vehicles': self.parking_tracker.current_vehicles,
+                'initial_count': self.parking_tracker.initial_count,
                 'fps': round(fps, 1),
                 'processed_frames': self.processed_frame_count,
                 'uptime': round(elapsed, 1)
-            }
+            })
         
         @app.route('/reset')
         def reset_counters():
             self.parking_tracker.vehicles_in = 0
             self.parking_tracker.vehicles_out = 0
-            return {"status": "counters reset"}
+            # Не сбрасываем initial_count и current_vehicles
+            self.parking_tracker.current_vehicles = self.parking_tracker.initial_count
+            return jsonify({"status": "counters reset"})
+        
+        @app.route('/set_initial', methods=['POST'])
+        def set_initial_count():
+            try:
+                data = request.get_json()
+                if not data or 'count' not in data:
+                    return jsonify({"error": "No count provided"}), 400
+                
+                count = int(data['count'])
+                if count < 0:
+                    return jsonify({"error": "Count must be positive"}), 400
+                
+                self.parking_tracker.set_initial_count(count)
+                return jsonify({"message": f"Initial count set to {count}"})
+            except Exception as e:
+                logger.error(f"Error setting initial count: {e}")
+                return jsonify({"error": str(e)}), 500
         
         logger.info(f"🌐 Запуск веб-сервера парковки на http://{self.config.web_host}:{self.config.web_port}")
         app.run(host=self.config.web_host, port=self.config.web_port, threaded=True, debug=False)
@@ -810,6 +940,7 @@ def main():
         if processor.start():
             logger.info("✅ Система подсчета автомобилей на парковке запущена")
             logger.info("🚗 Настройте counting_line в конфиге под вашу камеру")
+            logger.info("💡 Используйте веб-интерфейс для установки начального количества машин")
         else:
             logger.error("❌ Не удалось запустить систему")
     except KeyboardInterrupt:
