@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Production RTSP to YOLO Processor - ADVANCED OBJECT TRACKING with ANALYTICS
-CAR-ONLY DETECTION VERSION WITH CROSSING LINE AND REAL-TIME STATISTICS
+CAR-ONLY DETECTION VERSION WITH IMPROVED CROSSING LINE DETECTION
 """
 
 import cv2
@@ -80,6 +80,7 @@ class Config:
         
         # НАСТРОЙКИ ЛИНИИ ПЕРЕСЕЧЕНИЯ
         self.crossing_line_y_ratio = 0.5  # Позиция линии (0.5 = центр)
+        self.crossing_tolerance = 10  # Допуск для пересечения в пикселях
 
 class KalmanFilter:
     """Упрощенный Kalman фильтр для трекинга объектов"""
@@ -182,10 +183,15 @@ class TrackedObject:
         self.age += 1
         self.hit_streak += 1
         
-        # Статус пересечения линии
+        # Статус пересечения линии - УЛУЧШЕННАЯ ЛОГИКА
         self.has_crossed_line = False
         self.crossing_direction = None  # 'entering' или 'exiting'
         self.last_position_y = self._get_center_y()
+        self.crossing_verified = False  # Дополнительная проверка пересечения
+        
+        # История позиций для определения направления
+        self.position_history = deque(maxlen=10)  # Сохраняем последние позиции
+        self.position_history.append(self.last_position_y)
         
         # Визуальные особенности (упрощенные)
         self.appearance_features = self._extract_appearance(detection['bbox'])
@@ -233,27 +239,58 @@ class TrackedObject:
         self.appearance_features = self._extract_appearance(detection['bbox'])
     
     def check_line_crossing(self, line_y):
-        """Проверка пересечения линии и обновление статистики"""
+        """УЛУЧШЕННАЯ проверка пересечения линии с использованием истории позиций"""
+        if self.has_crossed_line and self.crossing_verified:
+            return False
+            
         current_y = self._get_center_y()
+        self.position_history.append(current_y)
         
-        # Если объект уже пересек линию, не считаем повторно
-        if self.has_crossed_line:
+        # Нужно минимум 3 позиции для определения направления
+        if len(self.position_history) < 3:
             self.last_position_y = current_y
             return False
         
-        # Проверяем пересечение линии
-        if (self.last_position_y <= line_y and current_y > line_y) or \
-           (self.last_position_y >= line_y and current_y < line_y):
+        # Определяем общее направление движения по истории
+        oldest_y = self.position_history[0]
+        direction = "down" if current_y > oldest_y else "up"
+        
+        # Проверяем пересечение линии с допуском
+        line_crossed = False
+        crossing_detected = None
+        
+        # Проверяем все сегменты в истории позиций
+        for i in range(1, len(self.position_history)):
+            prev_y = self.position_history[i-1]
+            curr_y = self.position_history[i]
             
-            # Определяем направление
-            if current_y > line_y:
-                self.crossing_direction = 'exiting'  # сверху вниз - выезжает
-            else:
-                self.crossing_direction = 'entering'  # снизу вверх - заезжает
-            
-            self.has_crossed_line = True
-            self.last_position_y = current_y
-            return True
+            # Проверяем пересечение с допуском
+            if (prev_y <= line_y + self.config.crossing_tolerance and 
+                curr_y >= line_y - self.config.crossing_tolerance) or \
+               (prev_y >= line_y - self.config.crossing_tolerance and 
+                curr_y <= line_y + self.config.crossing_tolerance):
+                
+                # Определяем направление пересечения
+                if curr_y > prev_y:  # Движение вниз
+                    crossing_detected = 'exiting'
+                else:  # Движение вверх
+                    crossing_detected = 'entering'
+                
+                line_crossed = True
+                break
+        
+        if line_crossed and crossing_detected:
+            # Дополнительная проверка: направление пересечения должно совпадать с общим направлением
+            if (crossing_detected == 'exiting' and direction == "down") or \
+               (crossing_detected == 'entering' and direction == "up"):
+                
+                self.has_crossed_line = True
+                self.crossing_direction = crossing_detected
+                self.crossing_verified = True
+                
+                logger.info(f"🚗 ПЕРЕСЕЧЕНИЕ: ID:{self.object_id} направление: {crossing_detected} "
+                          f"(история: {oldest_y:.1f} -> {current_y:.1f}, линия: {line_y})")
+                return True
         
         self.last_position_y = current_y
         return False
@@ -318,7 +355,7 @@ class AdvancedObjectTracker:
         for obj in self.tracked_objects.values():
             obj.predict()
             
-            # Проверка пересечения линии для каждого объекта
+            # УЛУЧШЕННАЯ проверка пересечения линии для каждого объекта
             if obj.check_line_crossing(line_y):
                 if obj.crossing_direction == 'entering':
                     self.entering_count += 1
@@ -726,6 +763,7 @@ class RTSPYOLOProcessor:
         """Обработка кадров с YOLO - с улучшенным трекингом, аналитикой и отслеживанием пересечений"""
         logger.info("🔍 Запуск обработки YOLO с улучшенным трекингом (ТОЛЬКО АВТОМОБИЛИ)")
         logger.info(f"📏 Линия пересечения установлена на Y={self.crossing_line_y} (координаты processing frame)")
+        logger.info(f"🎯 Допуск для пересечения: {self.config.crossing_tolerance} пикселей")
         
         frame_counter = 0
         
@@ -797,9 +835,9 @@ class RTSPYOLOProcessor:
                     scale_y = self.config.web_height / self.config.processing_height
                     web_line_y = int(self.crossing_line_y * scale_y)
                     
-                    # Отрисовка ЛИНИИ ПЕРЕСЕЧЕНИЯ
+                    # Отрисовка ЛИНИИ ПЕРЕСЕЧЕНИЯ с улучшенной видимостью
                     cv2.line(web_frame, (0, web_line_y), (self.config.web_width, web_line_y), 
-                            (0, 255, 255), 2, cv2.LINE_AA)
+                            (0, 255, 255), 3, cv2.LINE_AA)
                     
                     # Подпись для линии
                     cv2.putText(web_frame, "CROSSING LINE", (10, web_line_y - 10),
@@ -810,6 +848,11 @@ class RTSPYOLOProcessor:
                     stats_text = f"ENTERING: {crossing_stats['entering']} | EXITING: {crossing_stats['exiting']} | TOTAL: {crossing_stats['total']}"
                     cv2.putText(web_frame, stats_text, (10, 30),
                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    
+                    # Дополнительная информация о линии
+                    line_info = f"Line Y: {web_line_y} (tolerance: {int(self.config.crossing_tolerance * scale_y)})"
+                    cv2.putText(web_frame, line_info, (10, 60),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
                     
                     # Отрисовка детекций с улучшенной визуализацией
                     for det in tracked_detections:
@@ -826,12 +869,24 @@ class RTSPYOLOProcessor:
                         # Рисуем bounding box
                         cv2.rectangle(web_frame, (x1, y1), (x2, y2), color, 2)
                         
+                        # Отрисовка центра объекта для отладки
+                        center_x = int((x1 + x2) / 2)
+                        center_y = int((y1 + y2) / 2)
+                        cv2.circle(web_frame, (center_x, center_y), 4, color, -1)
+                        
                         # Подпись с улучшенной информацией
                         age = det.get('age', 1)
                         hit_streak = det.get('hit_streak', 1)
                         quality = hit_streak / age if age > 0 else 1.0
+                        
+                        # Добавляем информацию о пересечении
+                        crossing_status = ""
+                        if det.get('has_crossed_line', False):
+                            direction = det.get('crossing_direction', 'unknown')
+                            crossing_status = f" | CROSSED: {direction.upper()}"
+                        
                         label = f"ID:{object_id} {det['class_name']} {det['confidence']:.2f}"
-                        sub_label = f"Age:{age} Hits:{hit_streak} Q:{quality:.2f}"
+                        sub_label = f"Age:{age} Hits:{hit_streak} Q:{quality:.2f}{crossing_status}"
                         
                         (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                         
@@ -1059,6 +1114,7 @@ def main():
             logger.info("✅ Система запущена с улучшенным трекингом АВТОМОБИЛЕЙ")
             logger.info("🎯 Режим: ТОЛЬКО автомобили (car, motorcycle, bus, truck)")
             logger.info("📏 Линия пересечения: центр кадра (сверху вниз = выезд, снизу вверх = въезд)")
+            logger.info("🎯 Улучшенный алгоритм пересечения с историей позиций")
             logger.info("📊 Логи аналитики сохраняются в tracking_analytics.log")
             logger.info("📈 Детальная аналитика в detailed_tracking_analysis.log")
         else:
