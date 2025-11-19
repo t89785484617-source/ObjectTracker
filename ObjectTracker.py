@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Production RTSP to YOLO Processor - ADVANCED OBJECT TRACKING with ANALYTICS
+CAR-ONLY DETECTION VERSION
 """
 
 import cv2
@@ -73,6 +74,9 @@ class Config:
         # НАСТРОЙКИ ЛОГИРОВАНИЯ АНАЛИТИКИ
         self.analytics_log_interval = 5  # секунды между логами аналитики
         self.detailed_log_interval = 30  # секунды для детального лога
+        
+        # КЛАССЫ ДЛЯ ДЕТЕКЦИИ (ТОЛЬКО АВТОМОБИЛИ)
+        self.target_classes = [2, 3, 5, 7]  # car, motorcycle, bus, truck в COCO dataset
 
 class KalmanFilter:
     """Упрощенный Kalman фильтр для трекинга объектов"""
@@ -433,6 +437,7 @@ class RTSPYOLOProcessor:
             logger.info(f"Загрузка модели YOLO: {self.config.model_path}")
             self.model = YOLO(self.config.model_path)
             logger.info("✅ Модель YOLO загружена")
+            logger.info(f"🎯 Режим детекции: ТОЛЬКО АВТОМОБИЛИ (классы {self.config.target_classes})")
             return True
         except Exception as e:
             logger.error(f"❌ Ошибка загрузки YOLO: {e}")
@@ -645,7 +650,7 @@ class RTSPYOLOProcessor:
 
     def process_frames(self):
         """Обработка кадров с YOLO - с улучшенным трекингом и аналитикой"""
-        logger.info("🔍 Запуск обработки YOLO с улучшенным трекингом")
+        logger.info("🔍 Запуск обработки YOLO с улучшенным трекингом (ТОЛЬКО АВТОМОБИЛИ)")
         frame_counter = 0
         
         while self.running:
@@ -666,18 +671,23 @@ class RTSPYOLOProcessor:
                         self.config.processing_height
                     )
                     
-                    # YOLO обработка
+                    # YOLO обработка ТОЛЬКО ДЛЯ АВТОМОБИЛЕЙ
                     results = self.model(processing_frame, 
                                        conf=self.config.confidence_threshold,
+                                       classes=self.config.target_classes,  # ⭐ ФИЛЬТРАЦИЯ ПО КЛАССАМ
                                        verbose=False)
                     
-                    # Извлечение детекций
+                    # Извлечение детекций (только автомобили)
                     detections = []
                     for result in results:
                         boxes = result.boxes
                         if boxes is not None:
                             for box in boxes:
                                 cls = int(box.cls[0])
+                                # ⭐ ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА (на всякий случай)
+                                if cls not in self.config.target_classes:
+                                    continue
+                                    
                                 conf = float(box.conf[0])
                                 xyxy = box.xyxy[0].tolist()
                                 
@@ -780,7 +790,7 @@ class RTSPYOLOProcessor:
             <!DOCTYPE html>
             <html>
             <head>
-                <title>VisionGuard RTSP - Advanced Object Tracking</title>
+                <title>VisionGuard RTSP - Advanced CAR Tracking</title>
                 <meta charset="utf-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1">
                 <style>
@@ -948,7 +958,8 @@ def main():
     
     try:
         if processor.start():
-            logger.info("✅ Система запущена с улучшенным трекингом и аналитикой")
+            logger.info("✅ Система запущена с улучшенным трекингом АВТОМОБИЛЕЙ")
+            logger.info("🎯 Режим: ТОЛЬКО автомобили (car, motorcycle, bus, truck)")
             logger.info("📊 Логи аналитики сохраняются в tracking_analytics.log")
             logger.info("📈 Детальная аналитика в detailed_tracking_analysis.log")
         else:
