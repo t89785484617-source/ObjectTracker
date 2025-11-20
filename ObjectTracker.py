@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Production RTSP to YOLO Processor - ADVANCED OBJECT TRACKING with ANALYTICS
-CAR-ONLY DETECTION VERSION WITH IMPROVED CROSSING LINE DETECTION
+CAR-ONLY DETECTION VERSION WITH IMPROVED TRACKING STABILITY
 """
 
 import cv2
@@ -61,37 +61,36 @@ class Config:
         self.process_every_n = 3
         self.confidence_threshold = 0.5
         self.web_host = "0.0.0.0"
-        self.web_port = 8001
+        self.web_port = 8002
         self.web_quality = 60
         
-        # УЛУЧШЕННЫЕ НАСТРОЙКИ ТРЕКЕРА
-        self.tracker_max_age = 30
-        self.tracker_min_hits = 3
-        self.tracker_iou_threshold = 0.4
-        self.tracker_appearance_weight = 0.7
-        self.tracker_velocity_weight = 0.3
+        # УЛУЧШЕННЫЕ НАСТРОЙКИ ТРЕКЕРА ДЛЯ СТАБИЛЬНОСТИ
+        self.tracker_max_age = 45
+        self.tracker_min_hits = 4
+        self.tracker_iou_threshold = 0.3
+        self.tracker_appearance_weight = 0.6
+        self.tracker_velocity_weight = 0.4
         
         # НАСТРОЙКИ ЛОГИРОВАНИЯ АНАЛИТИКИ
-        self.analytics_log_interval = 5  # секунды между логами аналитики
-        self.detailed_log_interval = 30  # секунды для детального лога
+        self.analytics_log_interval = 5
+        self.detailed_log_interval = 30
         
         # КЛАССЫ ДЛЯ ДЕТЕКЦИИ (ТОЛЬКО АВТОМОБИЛИ)
-        self.target_classes = [2, 3, 5, 7]  # car, motorcycle, bus, truck в COCO dataset
+        self.target_classes = [2, 3, 5, 7]
         
-        # НАСТРОЙКИ ЛИНИИ ПЕРЕСЕЧЕНИЯ
-        self.crossing_line_y_ratio = 0.5  # Позиция линии (0.5 = центр)
-        self.crossing_tolerance = 10  # Допуск для пересечения в пикселях
+        # НАСТРОЙКИ ВЕРТИКАЛЬНОЙ ЛИНИИ ПЕРЕСЕЧЕНИЯ
+        self.crossing_line_x_ratio = 0.5
+        self.crossing_tolerance = 15
+        
+        # ЗАЩИТА ОТ ДУБЛИРОВАНИЯ ПЕРЕСЕЧЕНИЙ
+        self.crossing_cooldown = 300
+        self.min_crossing_confidence = 0.6
 
 class KalmanFilter:
-    """Упрощенный Kalman фильтр для трекинга объектов"""
-    
     def __init__(self):
-        # Состояние: [x, y, w, h, dx, dy]
         self.state = np.zeros(6)
-        # Ковариационная матрица
         self.covariance = np.eye(6) * 10
         
-        # Матрица перехода (предполагаем постоянную скорость)
         self.transition_matrix = np.array([
             [1, 0, 0, 0, 1, 0],
             [0, 1, 0, 0, 0, 1],
@@ -101,7 +100,6 @@ class KalmanFilter:
             [0, 0, 0, 0, 0, 1]
         ])
         
-        # Матрица наблюдения (измеряем только позицию и размер)
         self.observation_matrix = np.array([
             [1, 0, 0, 0, 0, 0],
             [0, 1, 0, 0, 0, 0],
@@ -109,13 +107,10 @@ class KalmanFilter:
             [0, 0, 0, 1, 0, 0]
         ])
         
-        # Шум процесса
         self.process_noise = np.eye(6) * 0.03
-        # Шум измерений
         self.measurement_noise = np.eye(4) * 0.1
     
     def init(self, bbox):
-        """Инициализация фильтра с bounding box"""
         x1, y1, x2, y2 = bbox
         w, h = x2 - x1, y2 - y1
         cx, cy = x1 + w/2, y1 + h/2
@@ -123,14 +118,12 @@ class KalmanFilter:
         self.covariance = np.eye(6) * 10
     
     def predict(self):
-        """Предсказание следующего состояния"""
         self.state = self.transition_matrix @ self.state
         self.covariance = (self.transition_matrix @ self.covariance @ 
                           self.transition_matrix.T) + self.process_noise
         return self.get_bbox()
     
     def update(self, bbox):
-        """Обновление состояния на основе измерения"""
         if bbox is None:
             return
         
@@ -139,17 +132,14 @@ class KalmanFilter:
         cx, cy = x1 + w/2, y1 + h/2
         measurement = np.array([cx, cy, w, h])
         
-        # Innovation
         y = measurement - self.observation_matrix @ self.state
         S = self.observation_matrix @ self.covariance @ self.observation_matrix.T + self.measurement_noise
         K = self.covariance @ self.observation_matrix.T @ np.linalg.inv(S)
         
-        # Обновление состояния
         self.state = self.state + K @ y
         self.covariance = (np.eye(6) - K @ self.observation_matrix) @ self.covariance
     
     def get_bbox(self):
-        """Получение bounding box из состояния"""
         cx, cy, w, h, _, _ = self.state
         x1 = cx - w/2
         y1 = cy - h/2
@@ -158,76 +148,80 @@ class KalmanFilter:
         return [x1, y1, x2, y2]
 
 class TrackedObject:
-    """Трекаемый объект с улучшенной стабильностью ID и отслеживанием пересечения линии"""
-    
     def __init__(self, object_id, detection, config):
         self.object_id = object_id
         self.detection = detection
         self.class_name = detection['class_name']
         self.confidence = detection['confidence']
         
-        # Kalman фильтр для сглаживания и предсказания
+        # ИСПРАВЛЕНИЕ: Сохраняем config как атрибут объекта
+        self.config = config
+        
         self.kalman = KalmanFilter()
         self.kalman.init(detection['bbox'])
         
-        # История позиций для трекинга
         self.track_history = deque(maxlen=50)
         self.update_track_history()
         
-        # Счетчики для подтверждения трека
         self.hit_streak = 0
         self.age = 0
         self.time_since_update = 0
         
-        # Сразу увеличиваем при создании
         self.age += 1
         self.hit_streak += 1
         
-        # Статус пересечения линии - УЛУЧШЕННАЯ ЛОГИКА
         self.has_crossed_line = False
-        self.crossing_direction = None  # 'entering' или 'exiting'
-        self.last_position_y = self._get_center_y()
-        self.crossing_verified = False  # Дополнительная проверка пересечения
+        self.crossing_direction = None
+        self.last_position_x = self._get_center_x()
+        self.crossing_verified = False
+        self.crossing_frame = 0
+        self.crossing_cooldown_counter = 0
         
-        # История позиций для определения направления
-        self.position_history = deque(maxlen=10)  # Сохраняем последние позиции
-        self.position_history.append(self.last_position_y)
+        self.position_history = deque(maxlen=8)
+        self.position_history.append(self.last_position_x)
         
-        # Визуальные особенности (упрощенные)
         self.appearance_features = self._extract_appearance(detection['bbox'])
-        
-        self.config = config
+        self.stable_features = self._extract_stable_features(detection['bbox'])
     
-    def _get_center_y(self):
-        """Получение Y-координаты центра объекта"""
+    def _get_center_x(self):
         bbox = self.kalman.get_bbox()
-        return (bbox[1] + bbox[3]) / 2
+        return (bbox[0] + bbox[2]) / 2
     
     def _extract_appearance(self, bbox):
-        """Упрощенное извлечение визуальных особенностей"""
         x1, y1, x2, y2 = bbox
         w, h = x2 - x1, y2 - y1
         aspect_ratio = w / h if h > 0 else 1.0
         area = w * h
         return np.array([w, h, aspect_ratio, area])
     
+    def _extract_stable_features(self, bbox):
+        x1, y1, x2, y2 = bbox
+        w, h = x2 - x1, y2 - y1
+        aspect_ratio = w / h if h > 0 else 1.0
+        area = w * h
+        # ИСПРАВЛЕНИЕ: Используем self.config вместо прямого обращения
+        normalized_w = w / self.config.processing_width
+        normalized_h = h / self.config.processing_height
+        return np.array([aspect_ratio, normalized_w, normalized_h, area])
+    
     def update_track_history(self):
-        """Обновление истории позиций"""
         bbox = self.kalman.get_bbox()
         cx = (bbox[0] + bbox[2]) / 2
         cy = (bbox[1] + bbox[3]) / 2
         self.track_history.append((cx, cy))
     
     def predict(self):
-        """Предсказание следующей позиции"""
         predicted_bbox = self.kalman.predict()
         self.age += 1
         self.time_since_update += 1
         self.update_track_history()
+        
+        if self.has_crossed_line:
+            self.crossing_cooldown_counter += 1
+            
         return predicted_bbox
     
     def update(self, detection):
-        """Обновление объекта новой детекцией"""
         self.detection = detection
         self.confidence = detection['confidence']
         self.kalman.update(detection['bbox'])
@@ -235,90 +229,90 @@ class TrackedObject:
         self.time_since_update = 0
         self.update_track_history()
         
-        # Обновление визуальных особенностей
         self.appearance_features = self._extract_appearance(detection['bbox'])
+        self.stable_features = self._extract_stable_features(detection['bbox'])
     
-    def check_line_crossing(self, line_y):
-        """УЛУЧШЕННАЯ проверка пересечения линии с использованием истории позиций"""
-        if self.has_crossed_line and self.crossing_verified:
+    def can_cross_again(self):
+        if not self.has_crossed_line:
+            return True
+        return self.crossing_cooldown_counter > self.config.crossing_cooldown
+    
+    def check_line_crossing(self, line_x):
+        if self.has_crossed_line and not self.can_cross_again():
             return False
             
-        current_y = self._get_center_y()
-        self.position_history.append(current_y)
+        current_x = self._get_center_x()
+        self.position_history.append(current_x)
         
-        # Нужно минимум 3 позиции для определения направления
         if len(self.position_history) < 3:
-            self.last_position_y = current_y
+            self.last_position_x = current_x
             return False
         
-        # Определяем общее направление движения по истории
-        oldest_y = self.position_history[0]
-        direction = "down" if current_y > oldest_y else "up"
+        oldest_x = self.position_history[0]
+        direction = "right" if current_x > oldest_x else "left"
         
-        # Проверяем пересечение линии с допуском
         line_crossed = False
         crossing_detected = None
         
-        # Проверяем все сегменты в истории позиций
         for i in range(1, len(self.position_history)):
-            prev_y = self.position_history[i-1]
-            curr_y = self.position_history[i]
+            prev_x = self.position_history[i-1]
+            curr_x = self.position_history[i]
             
-            # Проверяем пересечение с допуском
-            if (prev_y <= line_y + self.config.crossing_tolerance and 
-                curr_y >= line_y - self.config.crossing_tolerance) or \
-               (prev_y >= line_y - self.config.crossing_tolerance and 
-                curr_y <= line_y + self.config.crossing_tolerance):
+            if (prev_x <= line_x + self.config.crossing_tolerance and 
+                curr_x >= line_x - self.config.crossing_tolerance) or \
+               (prev_x >= line_x - self.config.crossing_tolerance and 
+                curr_x <= line_x + self.config.crossing_tolerance):
                 
-                # Определяем направление пересечения
-                if curr_y > prev_y:  # Движение вниз
+                if curr_x > prev_x:
                     crossing_detected = 'exiting'
-                else:  # Движение вверх
+                else:
                     crossing_detected = 'entering'
                 
                 line_crossed = True
                 break
         
         if line_crossed and crossing_detected:
-            # Дополнительная проверка: направление пересечения должно совпадать с общим направлением
-            if (crossing_detected == 'exiting' and direction == "down") or \
-               (crossing_detected == 'entering' and direction == "up"):
+            if (crossing_detected == 'exiting' and direction == "right") or \
+               (crossing_detected == 'entering' and direction == "left"):
                 
-                self.has_crossed_line = True
-                self.crossing_direction = crossing_detected
-                self.crossing_verified = True
-                
-                logger.info(f"🚗 ПЕРЕСЕЧЕНИЕ: ID:{self.object_id} направление: {crossing_detected} "
-                          f"(история: {oldest_y:.1f} -> {current_y:.1f}, линия: {line_y})")
-                return True
+                if self.confidence >= self.config.min_crossing_confidence:
+                    self.has_crossed_line = True
+                    self.crossing_direction = crossing_detected
+                    self.crossing_verified = True
+                    self.crossing_frame = self.age
+                    self.crossing_cooldown_counter = 0
+                    
+                    logger.info(f"🚗 ПЕРЕСЕЧЕНИЕ: ID:{self.object_id} направление: {crossing_detected} "
+                              f"(confidence: {self.confidence:.2f}, возраст: {self.age})")
+                    return True
         
-        self.last_position_y = current_y
+        self.last_position_x = current_x
         return False
     
     def similarity_score(self, detection):
-        """Оценка схожести с новой детекцией"""
         bbox1 = self.kalman.get_bbox()
         bbox2 = detection['bbox']
         
-        # 1. IoU (Intersection over Union)
         iou = self._calculate_iou(bbox1, bbox2)
         
-        # 2. Схожесть классов
         class_similarity = 1.0 if self.class_name == detection['class_name'] else 0.0
         
-        # 3. Схожесть размера и формы
-        features1 = self.appearance_features
-        features2 = self._extract_appearance(bbox2)
-        size_similarity = 1.0 - min(1.0, np.linalg.norm(features1 - features2) / 100)
+        features1 = self.stable_features
+        features2 = self._extract_stable_features(bbox2)
+        size_similarity = 1.0 - min(1.0, np.linalg.norm(features1 - features2))
         
-        # Комбинированная оценка
-        motion_similarity = iou * self.config.tracker_velocity_weight
-        appearance_similarity = (class_similarity + size_similarity) / 2 * self.config.tracker_appearance_weight
+        pred_bbox = self.kalman.get_bbox()
+        center1 = np.array([(pred_bbox[0] + pred_bbox[2]) / 2, (pred_bbox[1] + pred_bbox[3]) / 2])
+        center2 = np.array([(bbox2[0] + bbox2[2]) / 2, (bbox2[1] + bbox2[3]) / 2])
+        distance = np.linalg.norm(center1 - center2)
+        position_similarity = max(0, 1.0 - distance / 100.0)
+        
+        motion_similarity = (iou * 0.6 + position_similarity * 0.4) * self.config.tracker_velocity_weight
+        appearance_similarity = (class_similarity * 0.4 + size_similarity * 0.6) * self.config.tracker_appearance_weight
         
         return motion_similarity + appearance_similarity
     
     def _calculate_iou(self, box1, box2):
-        """Вычисление Intersection over Union"""
         x1_1, y1_1, x2_1, y2_1 = box1
         x1_2, y1_2, x2_2, y2_2 = box2
         
@@ -335,73 +329,144 @@ class TrackedObject:
         return inter_area / union_area if union_area > 0 else 0
 
 class AdvancedObjectTracker:
-    """Продвинутый трекер объектов с стабильными ID и отслеживанием пересечений"""
-    
     def __init__(self, config):
         self.config = config
         self.next_object_id = 1
-        self.tracked_objects = OrderedDict()  # object_id -> TrackedObject
+        self.tracked_objects = OrderedDict()
         self.frames_since_update = 0
+        self.last_crossing_time = 0
         
-        # Статистика пересечений
         self.entering_count = 0
         self.exiting_count = 0
+        
+        self.recent_crossings = {}
+        self.crossing_suppression_time = 10.0
+        
+        self.tracking_history = deque(maxlen=100)
     
-    def update(self, detections, line_y):
-        """Обновление трекера с новыми детекциями и проверка пересечений"""
+    def update(self, detections, line_x):
         self.frames_since_update += 1
         
-        # Предсказание позиций для всех существующих объектов
         for obj in self.tracked_objects.values():
             obj.predict()
             
-            # УЛУЧШЕННАЯ проверка пересечения линии для каждого объекта
-            if obj.check_line_crossing(line_y):
-                if obj.crossing_direction == 'entering':
-                    self.entering_count += 1
-                    logger.info(f"🚗 ВЪЕЗД: Автомобиль ID:{obj.object_id} заезжает (всего: {self.entering_count})")
-                else:
-                    self.exiting_count += 1
-                    logger.info(f"🚗 ВЫЕЗД: Автомобиль ID:{obj.object_id} выезжает (всего: {self.exiting_count})")
+            current_time = time.time()
+            if (obj.object_id not in self.recent_crossings or 
+                current_time - self.recent_crossings[obj.object_id] > self.crossing_suppression_time):
+                
+                if obj.check_line_crossing(line_x):
+                    self._register_crossing(obj)
         
-        # Создание матрицы схожести
-        if detections and self.tracked_objects:
-            similarity_matrix = self._create_similarity_matrix(detections)
-            matched_pairs = self._hungarian_matching(similarity_matrix)
-        else:
-            matched_pairs = []
+        active_detections = self._match_detections(detections)
         
-        # Обработка совпадений
+        self._update_unmatched_tracks()
+        
+        self._create_new_tracks(detections, active_detections)
+        
+        return self._get_active_detections()
+    
+    def _match_detections(self, detections):
+        if not detections or not self.tracked_objects:
+            return set()
+        
+        filtered_detections = [d for d in detections if d['confidence'] > 0.4]
+        
+        if not filtered_detections:
+            return set()
+        
+        similarity_matrix = self._create_similarity_matrix(filtered_detections)
+        matched_pairs = self._hungarian_matching(similarity_matrix)
+        
         matched_detections = set()
         matched_tracks = set()
         
         for det_idx, track_idx in matched_pairs:
             if similarity_matrix[det_idx][track_idx] > self.config.tracker_iou_threshold:
                 track_id = list(self.tracked_objects.keys())[track_idx]
-                detection = detections[det_idx]
+                detection = filtered_detections[det_idx]
                 
                 self.tracked_objects[track_id].update(detection)
                 matched_detections.add(det_idx)
                 matched_tracks.add(track_idx)
-        
-        # Обновление неподтвержденных треков
-        for track_idx, track_id in enumerate(list(self.tracked_objects.keys())):
-            if track_idx not in matched_tracks:
-                obj = self.tracked_objects[track_id]
-                obj.time_since_update += 1
                 
-                # Удаление старых треков
-                if obj.time_since_update > self.config.tracker_max_age:
-                    del self.tracked_objects[track_id]
+                logger.debug(f"✅ Сопоставление: ID:{track_id} с детекцией {det_idx} "
+                           f"(score: {similarity_matrix[det_idx][track_idx]:.3f})")
         
-        # Создание новых треков для неподходящих детекций
+        return matched_detections
+    
+    def _create_similarity_matrix(self, detections):
+        track_ids = list(self.tracked_objects.keys())
+        similarity_matrix = np.zeros((len(detections), len(track_ids)))
+        
+        for det_idx, detection in enumerate(detections):
+            for track_idx, track_id in enumerate(track_ids):
+                obj = self.tracked_objects[track_id]
+                similarity_matrix[det_idx][track_idx] = obj.similarity_score(detection)
+        
+        return similarity_matrix
+    
+    def _hungarian_matching(self, cost_matrix):
+        cost_matrix = 1 - cost_matrix
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        return list(zip(row_ind, col_ind))
+    
+    def _update_unmatched_tracks(self):
+        tracks_to_remove = []
+        
+        for track_id, obj in self.tracked_objects.items():
+            if obj.time_since_update > 0:
+                if obj.time_since_update > self.config.tracker_max_age:
+                    tracks_to_remove.append(track_id)
+                elif obj.time_since_update > self.config.tracker_max_age // 2:
+                    obj.confidence *= 0.95
+        
+        for track_id in tracks_to_remove:
+            if track_id in self.tracked_objects:
+                logger.debug(f"🗑️ Удален трек ID:{track_id} (age: {self.tracked_objects[track_id].age})")
+                del self.tracked_objects[track_id]
+    
+    def _create_new_tracks(self, detections, matched_detections):
         for det_idx, detection in enumerate(detections):
             if det_idx not in matched_detections:
-                # Только для детекций с высокой уверенностью создаем новые треки
-                if detection['confidence'] > 0.6:
-                    self._create_new_track(detection)
+                if detection['confidence'] > 0.5:
+                    if not self._is_duplicate_detection(detection):
+                        self._create_new_track(detection)
+    
+    def _is_duplicate_detection(self, detection):
+        for obj in self.tracked_objects.values():
+            similarity = obj.similarity_score(detection)
+            if similarity > self.config.tracker_iou_threshold * 0.8:
+                logger.debug(f"🚫 Подавлен дубликат детекции для ID:{obj.object_id} (score: {similarity:.3f})")
+                return True
+        return False
+    
+    def _create_new_track(self, detection):
+        object_id = self.next_object_id
+        self.tracked_objects[object_id] = TrackedObject(object_id, detection, self.config)
+        logger.info(f"🆕 Новый трек: ID:{object_id} {detection['class_name']} "
+                   f"(confidence: {detection['confidence']:.2f})")
+        self.next_object_id += 1
+    
+    def _register_crossing(self, obj):
+        current_time = time.time()
         
-        # Возврат активных треков
+        if (obj.object_id in self.recent_crossings and 
+            current_time - self.recent_crossings[obj.object_id] < self.crossing_suppression_time):
+            logger.debug(f"🚫 Подавлено повторное пересечение ID:{obj.object_id}")
+            return
+        
+        self.recent_crossings[obj.object_id] = current_time
+        
+        if obj.crossing_direction == 'entering':
+            self.entering_count += 1
+            logger.info(f"🚗 ВЪЕЗД: Автомобиль ID:{obj.object_id} заезжает СПРАВА НАЛЕВО "
+                       f"(всего: {self.entering_count}, confidence: {obj.confidence:.2f})")
+        else:
+            self.exiting_count += 1
+            logger.info(f"🚗 ВЫЕЗД: Автомобиль ID:{obj.object_id} выезжает СЛЕВА НАПРАВО "
+                       f"(всего: {self.exiting_count}, confidence: {obj.confidence:.2f})")
+    
+    def _get_active_detections(self):
         active_detections = []
         for obj in self.tracked_objects.values():
             if obj.time_since_update == 0 or obj.hit_streak >= self.config.tracker_min_hits:
@@ -416,33 +481,7 @@ class AdvancedObjectTracker:
         
         return active_detections
     
-    def _create_similarity_matrix(self, detections):
-        """Создание матрицы схожести между детекциями и треками"""
-        track_ids = list(self.tracked_objects.keys())
-        similarity_matrix = np.zeros((len(detections), len(track_ids)))
-        
-        for det_idx, detection in enumerate(detections):
-            for track_idx, track_id in enumerate(track_ids):
-                obj = self.tracked_objects[track_id]
-                similarity_matrix[det_idx][track_idx] = obj.similarity_score(detection)
-        
-        return similarity_matrix
-    
-    def _hungarian_matching(self, cost_matrix):
-        """Венгерский алгоритм для оптимального сопоставления"""
-        # Преобразование в матрицу стоимости (1 - схожесть)
-        cost_matrix = 1 - cost_matrix
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
-        return list(zip(row_ind, col_ind))
-    
-    def _create_new_track(self, detection):
-        """Создание нового трека"""
-        object_id = self.next_object_id
-        self.tracked_objects[object_id] = TrackedObject(object_id, detection, self.config)
-        self.next_object_id += 1
-    
     def get_crossing_stats(self):
-        """Получение статистики пересечений"""
         return {
             'entering': self.entering_count,
             'exiting': self.exiting_count,
@@ -454,16 +493,11 @@ class RTSPYOLOProcessor:
         self.config = config
         self.frame_size = config.capture_width * config.capture_height * 3
         
-        # Инициализация улучшенного трекера
         self.object_tracker = AdvancedObjectTracker(config)
         
-        # Позиция линии пересечения (в координатах processing frame)
-        self.crossing_line_y = int(self.config.processing_height * self.config.crossing_line_y_ratio)
+        self.crossing_line_x = int(self.config.processing_width * self.config.crossing_line_x_ratio)
         
-        # ЕДИНСТВЕННЫЙ буфер для веб-вывода
         self.output_buffer = queue.Queue(maxsize=1)
-        
-        # Отдельный буфер для обработки
         self.processing_buffer = queue.Queue(maxsize=5)
         
         self.running = False
@@ -472,7 +506,6 @@ class RTSPYOLOProcessor:
         self.detection_count = 0
         self.start_time = time.time()
         
-        # Для аналитики
         self.last_analytics_log_time = 0
         self.last_detailed_log_time = 0
         self.tracking_stats = {
@@ -484,16 +517,12 @@ class RTSPYOLOProcessor:
             'track_quality_history': []
         }
         
-        # ЕДИНСТВЕННОЕ место для хранения текущего кадра
         self._current_output_frame = self._create_info_frame("Starting...")
         self._current_detections = []
         self._frame_lock = threading.Lock()
 
     def _create_info_frame(self, message):
-        """Создание информационного кадра"""
         frame = np.zeros((self.config.web_height, self.config.web_width, 3), dtype=np.uint8)
-        
-        # Градиентный фон
         for i in range(self.config.web_height):
             color = int(50 + (i / self.config.web_height) * 50)
             frame[i, :] = [color, color, color]
@@ -501,11 +530,9 @@ class RTSPYOLOProcessor:
         text_y = self.config.web_height // 2
         cv2.putText(frame, message, (50, text_y), 
                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-        
         return frame
 
     def start_ffmpeg(self):
-        """Запуск FFmpeg с ФИКСИРОВАННЫМ разрешением"""
         try:
             command = [
                 'ffmpeg',
@@ -534,7 +561,6 @@ class RTSPYOLOProcessor:
             return False
 
     def load_yolo_model(self):
-        """Загрузка модели YOLO"""
         try:
             logger.info(f"Загрузка модели YOLO: {self.config.model_path}")
             self.model = YOLO(self.config.model_path)
@@ -546,7 +572,6 @@ class RTSPYOLOProcessor:
             return False
 
     def resize_frame_proportional(self, frame, target_width, target_height):
-        """Изменение размера кадра с сохранением пропорций"""
         h, w = frame.shape[:2]
         
         aspect_ratio = w / h
@@ -571,7 +596,6 @@ class RTSPYOLOProcessor:
         return canvas
 
     def capture_frames(self):
-        """Захват кадров из RTSP - ТОЛЬКО ЗАХВАТ"""
         logger.info("🎥 Запуск захвата кадров")
         
         consecutive_errors = 0
@@ -588,12 +612,11 @@ class RTSPYOLOProcessor:
                         frame = np.frombuffer(raw_frame, dtype=np.uint8)
                         frame = frame.reshape((self.config.capture_height, self.config.capture_width, 3))
                         
-                        # Кладем в буфер обработки (не блокируем если полон)
                         if not self.processing_buffer.full():
                             self.processing_buffer.put(frame)
                         
                         self.capture_frame_count += 1
-                        consecutive_errors = 0  # Сбрасываем счетчик ошибок
+                        consecutive_errors = 0
                         
                     else:
                         logger.warning(f"Неполный кадр: {len(raw_frame)}/{self.frame_size}")
@@ -602,7 +625,6 @@ class RTSPYOLOProcessor:
                     logger.warning("Таймаут чтения кадра")
                     consecutive_errors += 1
                 
-                # Перезапуск при множественных ошибках
                 if consecutive_errors >= max_errors:
                     logger.error("Слишком много ошибок, перезапуск захвата...")
                     self.restart_ffmpeg()
@@ -615,7 +637,6 @@ class RTSPYOLOProcessor:
                 time.sleep(1)
 
     def restart_ffmpeg(self):
-        """Перезапуск FFmpeg при проблемах"""
         logger.info("Перезапуск FFmpeg...")
         if hasattr(self, 'pipe'):
             try:
@@ -627,29 +648,23 @@ class RTSPYOLOProcessor:
         return self.start_ffmpeg()
 
     def get_latest_frame(self):
-        """Получение последнего кадра - БЕЗ ОЧИСТКИ БУФЕРОВ"""
         with self._frame_lock:
             return self._current_output_frame.copy(), self._current_detections.copy()
 
     def _get_color_by_id(self, object_id):
-        """Генерация уникального цвета на основе ID"""
-        # Используем хэш для стабильных цветов
-        hue = (object_id * 50) % 180  # HSV hue от 0 до 180
+        hue = (object_id * 50) % 180
         hsv_color = np.uint8([[[hue, 255, 255]]])
         bgr_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)
         return [int(c) for c in bgr_color[0][0]]
 
     def _log_tracking_analytics(self):
-        """Логирование аналитики трекинга"""
         current_time = time.time()
         
-        # Логируем базовую аналитику каждые N секунд
         if current_time - self.last_analytics_log_time >= self.config.analytics_log_interval:
             active_tracks = len(self.object_tracker.tracked_objects)
             active_detections = len(self._current_detections)
             crossing_stats = self.object_tracker.get_crossing_stats()
             
-            # Собираем статистику по активным трекам
             track_qualities = []
             class_distribution = {}
             
@@ -657,17 +672,14 @@ class RTSPYOLOProcessor:
                 quality = obj.hit_streak / obj.age if obj.age > 0 else 1.0
                 track_qualities.append(quality)
                 
-                # Распределение по классам
                 class_name = obj.class_name
                 class_distribution[class_name] = class_distribution.get(class_name, 0) + 1
                 
-                # Обновляем максимальные значения
                 self.tracking_stats['max_track_age'] = max(self.tracking_stats['max_track_age'], obj.age)
                 self.tracking_stats['max_track_hits'] = max(self.tracking_stats['max_track_hits'], obj.hit_streak)
             
             avg_quality = np.mean(track_qualities) if track_qualities else 0
             
-            # Логируем базовую аналитику с учетом статистики пересечений
             analytics_data = {
                 'timestamp': datetime.now().isoformat(),
                 'active_tracks': active_tracks,
@@ -684,7 +696,6 @@ class RTSPYOLOProcessor:
             analytics_logger.info(json.dumps(analytics_data))
             self.last_analytics_log_time = current_time
             
-            # Сохраняем историю качества
             self.tracking_stats['track_quality_history'].append({
                 'time': current_time,
                 'avg_quality': avg_quality,
@@ -692,17 +703,14 @@ class RTSPYOLOProcessor:
                 'crossing_stats': crossing_stats
             })
             
-            # Ограничиваем размер истории
             if len(self.tracking_stats['track_quality_history']) > 1000:
                 self.tracking_stats['track_quality_history'] = self.tracking_stats['track_quality_history'][-1000:]
         
-        # Детальное логирование каждые 30 секунд
         if current_time - self.last_detailed_log_time >= self.config.detailed_log_interval:
             self._log_detailed_tracking_info()
             self.last_detailed_log_time = current_time
 
     def _log_detailed_tracking_info(self):
-        """Детальное логирование информации о треках"""
         crossing_stats = self.object_tracker.get_crossing_stats()
         
         detailed_info = {
@@ -729,7 +737,6 @@ class RTSPYOLOProcessor:
             }
             detailed_info['current_tracks'].append(track_info)
         
-        # Логируем в отдельный файл для детального анализа
         with open('detailed_tracking_analysis.log', 'a') as f:
             f.write(json.dumps(detailed_info) + '\n')
         
@@ -739,8 +746,6 @@ class RTSPYOLOProcessor:
                    f"въездов: {crossing_stats['entering']}, выездов: {crossing_stats['exiting']}")
 
     def _update_tracking_stats(self, detections_before, detections_after):
-        """Обновление статистики трекинга после обработки кадра"""
-        # Обновляем счетчики созданных/потерянных треков
         current_track_ids = set(obj.object_id for obj in self.object_tracker.tracked_objects.values())
         previous_track_ids = set(det['object_id'] for det in detections_before) if detections_before else set()
         
@@ -750,58 +755,47 @@ class RTSPYOLOProcessor:
         self.tracking_stats['total_tracks_created'] += len(new_tracks)
         self.tracking_stats['total_tracks_lost'] += len(lost_tracks)
         
-        # Логируем создание новых треков
         for track_id in new_tracks:
             obj = self.object_tracker.tracked_objects[track_id]
             logger.info(f"🆕 Новый трек: ID:{track_id} {obj.class_name} (confidence: {obj.confidence:.2f})")
         
-        # Логируем потерю треков
         for track_id in lost_tracks:
             logger.info(f"❌ Потерян трек: ID:{track_id}")
 
     def process_frames(self):
-        """Обработка кадров с YOLO - с улучшенным трекингом, аналитикой и отслеживанием пересечений"""
-        logger.info("🔍 Запуск обработки YOLO с улучшенным трекингом (ТОЛЬКО АВТОМОБИЛИ)")
-        logger.info(f"📏 Линия пересечения установлена на Y={self.crossing_line_y} (координаты processing frame)")
-        logger.info(f"🎯 Допуск для пересечения: {self.config.crossing_tolerance} пикселей")
+        logger.info("🔍 Запуск обработки YOLO с УЛУЧШЕННЫМ трекингом")
+        logger.info(f"🎯 Защита от дублирования: {self.config.crossing_cooldown} кадров")
+        logger.info(f"📏 Линия пересечения: X={self.crossing_line_x}")
         
         frame_counter = 0
         
         while self.running:
             try:
-                # Берем кадр из буфера обработки
                 frame = self.processing_buffer.get(timeout=1.0)
                 frame_counter += 1
                 
-                # Сохраняем предыдущие детекции для анализа изменений
                 previous_detections = self._current_detections.copy()
                 
-                # Обрабатываем каждый N-й кадр
                 if frame_counter % self.config.process_every_n == 0:
-                    # Подготовка кадра для YOLO
                     processing_frame = self.resize_frame_proportional(
                         frame, 
                         self.config.processing_width, 
                         self.config.processing_height
                     )
                     
-                    # YOLO обработка ТОЛЬКО ДЛЯ АВТОМОБИЛЕЙ
                     results = self.model(processing_frame, 
                                        conf=self.config.confidence_threshold,
-                                       classes=self.config.target_classes,  # ФИЛЬТРАЦИЯ ПО КЛАССАМ
+                                       classes=self.config.target_classes,
                                        verbose=False)
                     
-                    # Извлечение детекций (только автомобили)
                     detections = []
                     for result in results:
                         boxes = result.boxes
                         if boxes is not None:
                             for box in boxes:
                                 cls = int(box.cls[0])
-                                # ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА (на всякий случай)
                                 if cls not in self.config.target_classes:
                                     continue
-                                    
                                 conf = float(box.conf[0])
                                 xyxy = box.xyxy[0].tolist()
                                 
@@ -814,105 +808,25 @@ class RTSPYOLOProcessor:
                                 detections.append(detection)
                                 self.detection_count += 1
                     
-                    # ОБНОВЛЕНИЕ УЛУЧШЕННОГО ТРЕКЕРА С ПЕРЕДАЧЕЙ ПОЗИЦИИ ЛИНИИ
-                    tracked_detections = self.object_tracker.update(detections, self.crossing_line_y)
+                    tracked_detections = self.object_tracker.update(detections, self.crossing_line_x)
                     
-                    # ОБНОВЛЯЕМ СТАТИСТИКУ ТРЕКИНГА
                     self._update_tracking_stats(previous_detections, tracked_detections)
-                    
-                    # ЛОГИРУЕМ АНАЛИТИКУ
                     self._log_tracking_analytics()
                     
-                    # Создание кадра для веб-вывода
                     web_frame = self.resize_frame_proportional(
                         frame,
                         self.config.web_width,
                         self.config.web_height
                     )
                     
-                    # Масштабирование bounding boxes и линии
                     scale_x = self.config.web_width / self.config.processing_width
                     scale_y = self.config.web_height / self.config.processing_height
-                    web_line_y = int(self.crossing_line_y * scale_y)
+                    web_line_x = int(self.crossing_line_x * scale_x)
                     
-                    # Отрисовка ЛИНИИ ПЕРЕСЕЧЕНИЯ с улучшенной видимостью
-                    cv2.line(web_frame, (0, web_line_y), (self.config.web_width, web_line_y), 
-                            (0, 255, 255), 3, cv2.LINE_AA)
+                    self._draw_crossing_line(web_frame, web_line_x)
+                    self._draw_stats(web_frame, scale_x)
+                    self._draw_detections(web_frame, tracked_detections, scale_x, scale_y)
                     
-                    # Подпись для линии
-                    cv2.putText(web_frame, "CROSSING LINE", (10, web_line_y - 10),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                    
-                    # Статистика пересечений на кадре
-                    crossing_stats = self.object_tracker.get_crossing_stats()
-                    stats_text = f"ENTERING: {crossing_stats['entering']} | EXITING: {crossing_stats['exiting']} | TOTAL: {crossing_stats['total']}"
-                    cv2.putText(web_frame, stats_text, (10, 30),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                    
-                    # Дополнительная информация о линии
-                    line_info = f"Line Y: {web_line_y} (tolerance: {int(self.config.crossing_tolerance * scale_y)})"
-                    cv2.putText(web_frame, line_info, (10, 60),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-                    
-                    # Отрисовка детекций с улучшенной визуализацией
-                    for det in tracked_detections:
-                        x1, y1, x2, y2 = det['bbox']
-                        x1 = int(x1 * scale_x)
-                        y1 = int(y1 * scale_y) 
-                        x2 = int(x2 * scale_x)
-                        y2 = int(y2 * scale_y)
-                        
-                        # Уникальный цвет на основе ID
-                        object_id = det.get('object_id', 0)
-                        color = self._get_color_by_id(object_id)
-                        
-                        # Рисуем bounding box
-                        cv2.rectangle(web_frame, (x1, y1), (x2, y2), color, 2)
-                        
-                        # Отрисовка центра объекта для отладки
-                        center_x = int((x1 + x2) / 2)
-                        center_y = int((y1 + y2) / 2)
-                        cv2.circle(web_frame, (center_x, center_y), 4, color, -1)
-                        
-                        # Подпись с улучшенной информацией
-                        age = det.get('age', 1)
-                        hit_streak = det.get('hit_streak', 1)
-                        quality = hit_streak / age if age > 0 else 1.0
-                        
-                        # Добавляем информацию о пересечении
-                        crossing_status = ""
-                        if det.get('has_crossed_line', False):
-                            direction = det.get('crossing_direction', 'unknown')
-                            crossing_status = f" | CROSSED: {direction.upper()}"
-                        
-                        label = f"ID:{object_id} {det['class_name']} {det['confidence']:.2f}"
-                        sub_label = f"Age:{age} Hits:{hit_streak} Q:{quality:.2f}{crossing_status}"
-                        
-                        (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                        
-                        # Фон для текста
-                        cv2.rectangle(web_frame, (x1, y1-text_height-25), 
-                                    (x1+text_width, y1), color, -1)
-                        cv2.putText(web_frame, label, (x1, y1-15), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                        cv2.putText(web_frame, sub_label, (x1, y1-5), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                        
-                        # Отрисовка истории трекинга
-                        if 'track_history' in det and len(det['track_history']) > 1:
-                            points = []
-                            for point in det['track_history']:
-                                px, py = point
-                                px = int(px * scale_x)
-                                py = int(py * scale_y)
-                                points.append((px, py))
-                            
-                            # Рисуем плавную линию трекинга
-                            for i in range(1, len(points)):
-                                thickness = max(1, int(3 * (i / len(points))))
-                                cv2.line(web_frame, points[i-1], points[i], color, thickness)
-                    
-                    # ОБНОВЛЕНИЕ с блокировкой!
                     with self._frame_lock:
                         self._current_output_frame = web_frame.copy()
                         self._current_detections = tracked_detections.copy()
@@ -925,8 +839,88 @@ class RTSPYOLOProcessor:
                 logger.error(f"Ошибка обработки: {e}")
                 time.sleep(0.1)
 
+    def _draw_crossing_line(self, frame, line_x):
+        cv2.line(frame, (line_x, 0), (line_x, self.config.web_height), 
+                (0, 255, 255), 3, cv2.LINE_AA)
+        
+        cv2.putText(frame, "CROSSING LINE", (line_x + 10, 30),
+                  cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        
+        cv2.arrowedLine(frame, (line_x + 50, 60), (line_x - 50, 60), 
+                       (0, 255, 0), 2, tipLength=0.3)
+        cv2.putText(frame, "ENTERING", (line_x + 60, 65),
+                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        cv2.arrowedLine(frame, (line_x - 50, 90), (line_x + 50, 90), 
+                       (255, 0, 0), 2, tipLength=0.3)
+        cv2.putText(frame, "EXITING", (line_x - 80, 95),
+                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+
+    def _draw_stats(self, frame, scale_x):
+        crossing_stats = self.object_tracker.get_crossing_stats()
+        stats_text = f"ENTERING: {crossing_stats['entering']} | EXITING: {crossing_stats['exiting']} | TOTAL: {crossing_stats['total']}"
+        cv2.putText(frame, stats_text, (10, 30),
+                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        line_info = f"Line X: {int(self.crossing_line_x * scale_x)} (tolerance: {int(self.config.crossing_tolerance * scale_x)})"
+        cv2.putText(frame, line_info, (10, 60),
+                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        
+        protection_info = f"Anti-duplicate: {self.config.crossing_cooldown}frames"
+        cv2.putText(frame, protection_info, (10, 80),
+                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+    def _draw_detections(self, frame, detections, scale_x, scale_y):
+        for det in detections:
+            x1, y1, x2, y2 = det['bbox']
+            x1 = int(x1 * scale_x)
+            y1 = int(y1 * scale_y) 
+            x2 = int(x2 * scale_x)
+            y2 = int(y2 * scale_y)
+            
+            object_id = det.get('object_id', 0)
+            color = self._get_color_by_id(object_id)
+            
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            
+            center_x = int((x1 + x2) / 2)
+            center_y = int((y1 + y2) / 2)
+            cv2.circle(frame, (center_x, center_y), 4, color, -1)
+            
+            age = det.get('age', 1)
+            hit_streak = det.get('hit_streak', 1)
+            quality = hit_streak / age if age > 0 else 1.0
+            
+            crossing_status = ""
+            if det.get('has_crossed_line', False):
+                direction = det.get('crossing_direction', 'unknown')
+                crossing_status = f" | CROSSED: {direction.upper()}"
+            
+            label = f"ID:{object_id} {det['class_name']} {det['confidence']:.2f}"
+            sub_label = f"Age:{age} Hits:{hit_streak} Q:{quality:.2f}{crossing_status}"
+            
+            (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            
+            cv2.rectangle(frame, (x1, y1-text_height-25), 
+                        (x1+text_width, y1), color, -1)
+            cv2.putText(frame, label, (x1, y1-15), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(frame, sub_label, (x1, y1-5), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            
+            if 'track_history' in det and len(det['track_history']) > 1:
+                points = []
+                for point in det['track_history']:
+                    px, py = point
+                    px = int(px * scale_x)
+                    py = int(py * scale_y)
+                    points.append((px, py))
+                
+                for i in range(1, len(points)):
+                    thickness = max(1, int(3 * (i / len(points))))
+                    cv2.line(frame, points[i-1], points[i], color, thickness)
+
     def start_web_server(self):
-        """Запуск веб-сервера с фиксированным FPS и аналитикой"""
         app = Flask(__name__)
         
         @app.route('/')
@@ -966,10 +960,8 @@ class RTSPYOLOProcessor:
                         }
                     }
 
-                    // Обновляем видео каждые 5 минут для надежности
                     setInterval(refreshVideo, 300000);
 
-                    // Автоматический рефреш при ошибках
                     document.getElementById('video').onerror = function() {
                         setTimeout(refreshVideo, 1000);
                     };
@@ -1008,7 +1000,6 @@ class RTSPYOLOProcessor:
             elapsed = time.time() - self.start_time
             fps = self.processed_frame_count / elapsed if elapsed > 0 else 0
             
-            # Рассчитываем качество трекинга
             track_qualities = []
             for obj in self.object_tracker.tracked_objects.values():
                 if obj.age > 0:
@@ -1034,7 +1025,6 @@ class RTSPYOLOProcessor:
         
         @app.route('/analytics')
         def analytics():
-            """Расширенная аналитика трекинга"""
             current_tracks = []
             for obj_id, obj in self.object_tracker.tracked_objects.items():
                 quality = obj.hit_streak / obj.age if obj.age > 0 else 1.0
@@ -1050,7 +1040,6 @@ class RTSPYOLOProcessor:
                     'crossing_direction': obj.crossing_direction
                 })
             
-            # Сортируем по качеству
             current_tracks.sort(key=lambda x: x['quality'], reverse=True)
             
             crossing_stats = self.object_tracker.get_crossing_stats()
@@ -1067,7 +1056,6 @@ class RTSPYOLOProcessor:
         app.run(host=self.config.web_host, port=self.config.web_port, threaded=True, debug=False)
 
     def start_processing(self):
-        """Запуск обработки"""
         if not self.start_ffmpeg():
             return False
         
@@ -1076,34 +1064,43 @@ class RTSPYOLOProcessor:
         
         self.running = True
         
-        # Инициализация начального кадра
         with self._frame_lock:
             self._current_output_frame = self._create_info_frame("Initializing...")
         
-        # Запуск потоков
         capture_thread = threading.Thread(target=self.capture_frames, daemon=True)
         process_thread = threading.Thread(target=self.process_frames, daemon=True)
         
         capture_thread.start()
-        time.sleep(3)  # Даем время на запуск захвата
+        time.sleep(3)
         process_thread.start()
         
         logger.info("✅ Все потоки запущены")
         return True
 
     def start(self):
-        """Запуск всей системы"""
         if not self.start_processing():
             return False
         
-        self.start_web_server()
+        web_thread = threading.Thread(target=self.start_web_server, daemon=True)
+        web_thread.start()
+        
         return True
 
     def stop(self):
-        """Остановка"""
+        logger.info("🛑 Остановка системы...")
         self.running = False
+        
         if hasattr(self, 'pipe'):
-            self.pipe.terminate()
+            try:
+                self.pipe.terminate()
+                self.pipe.wait(timeout=5)
+                logger.info("✅ FFmpeg остановлен")
+            except Exception as e:
+                logger.error(f"❌ Ошибка при остановке FFmpeg: {e}")
+                try:
+                    self.pipe.kill()
+                except:
+                    pass
 
 def main():
     config = Config()
@@ -1111,12 +1108,15 @@ def main():
     
     try:
         if processor.start():
-            logger.info("✅ Система запущена с улучшенным трекингом АВТОМОБИЛЕЙ")
-            logger.info("🎯 Режим: ТОЛЬКО автомобили (car, motorcycle, bus, truck)")
-            logger.info("📏 Линия пересечения: центр кадра (сверху вниз = выезд, снизу вверх = въезд)")
-            logger.info("🎯 Улучшенный алгоритм пересечения с историей позиций")
-            logger.info("📊 Логи аналитики сохраняются в tracking_analytics.log")
-            logger.info("📈 Детальная аналитика в detailed_tracking_analysis.log")
+            logger.info("✅ Система запущена с УЛУЧШЕННЫМ трекингом")
+            logger.info("🎯 Режим: ТОЛЬКО автомобили")
+            logger.info("🛡️ Защита от дублирования пересечений: ВКЛЮЧЕНА")
+            logger.info(f"⏰ Период охлаждения: {config.crossing_cooldown} кадров")
+            logger.info("📏 Вертикальная линия пересечения")
+            
+            while True:
+                time.sleep(1)
+                
         else:
             logger.error("❌ Не удалось запустить систему")
     except KeyboardInterrupt:
